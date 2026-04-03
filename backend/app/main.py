@@ -8,11 +8,15 @@ Configures the application with:
 - OpenAPI documentation
 """
 
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import AsyncGenerator
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.app.api.routes import router as api_router
 from backend.app.core.config import get_settings
@@ -96,6 +100,25 @@ def create_app() -> FastAPI:
             version=settings.app_version,
             environment=settings.environment,
         )
+
+    # Static files & favicon
+    static_dir = Path(__file__).parent / "static"
+    if static_dir.is_dir():
+        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    favicon_path = static_dir / "favicon.ico"
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon():
+        """Serve the favicon."""
+        if favicon_path.is_file():
+            return FileResponse(
+                str(favicon_path),
+                media_type="image/x-icon",
+            )
+        from fastapi.responses import Response
+
+        return Response(status_code=204)
 
     return app
 
