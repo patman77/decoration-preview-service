@@ -1,0 +1,38 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.mypy_cache
+.coverage
+htmlcov/
+venv/
+.venv/
+*.egg-info/
+
+# CDK
+infrastructure/cdk.out/
+
+# Docs
+docs/
+*.md
+LICENSE
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment files
+.env
+.env.*
+!.env.production.template
+
+# Tests
+tests/
+pytest.ini
