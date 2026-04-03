@@ -166,6 +166,16 @@ class HealthResponse(BaseModel):
     environment: str = Field(..., description="Deployment environment")
 
 
+class ServiceInfoResponse(BaseModel):
+    """Root endpoint response with service information and navigation links."""
+    service: str = Field(..., description="Service name")
+    version: str = Field(..., description="API version")
+    description: str = Field(..., description="Brief service description")
+    docs_url: str = Field(..., description="Interactive API documentation URL")
+    health_url: str = Field(..., description="Health check endpoint URL")
+    api_base_url: str = Field(..., description="Base URL for API endpoints")
+
+
 class ErrorResponse(BaseModel):
     """Standard error response."""
     detail: str = Field(..., description="Error message")

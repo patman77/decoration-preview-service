@@ -30,7 +30,7 @@ from backend.app.core.exceptions import (
     render_job_not_found_handler,
 )
 from backend.app.core.logging import get_logger, setup_logging
-from backend.app.models.schemas import HealthResponse
+from backend.app.models.schemas import HealthResponse, ServiceInfoResponse
 
 
 @asynccontextmanager
@@ -85,6 +85,28 @@ def create_app() -> FastAPI:
 
     # Include API routes
     app.include_router(api_router)
+
+    # Root endpoint (no auth required)
+    @app.get(
+        "/",
+        response_model=ServiceInfoResponse,
+        tags=["Service Info"],
+        summary="Service information",
+        description="Returns basic service information and navigation links.",
+    )
+    async def root() -> ServiceInfoResponse:
+        """Root endpoint returning service metadata and useful links."""
+        return ServiceInfoResponse(
+            service=settings.app_name,
+            version=settings.app_version,
+            description=(
+                "API service for previewing 2D decorations on 3D toy elements. "
+                "Upload artwork files and receive rendered preview images."
+            ),
+            docs_url="/docs",
+            health_url="/health",
+            api_base_url=settings.api_prefix,
+        )
 
     # Health check (no auth required)
     @app.get(
