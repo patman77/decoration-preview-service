@@ -176,15 +176,20 @@ curl http://localhost:8000/health
 
 ### Submit a Render Job
 
+A sample artwork file is included in the repository for testing:
+
 ```bash
 curl -X POST http://localhost:8000/api/v1/render \
   -H "X-API-Key: dev-api-key-change-in-production" \
-  -F "artwork_file=@artwork.png" \
+  -F "artwork_file=@examples/sample_artwork.png" \
   -F "element_id=elem-minifig-torso-001" \
   -F "output_format=png" \
   -F "resolution_width=1024" \
   -F "resolution_height=1024"
 ```
+
+> **Note:** Run this command from the project root directory so that the
+> relative path `examples/sample_artwork.png` resolves correctly.
 
 ```json
 {
