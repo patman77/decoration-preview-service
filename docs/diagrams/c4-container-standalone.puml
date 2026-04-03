@@ -1,0 +1,69 @@
+@startuml C4_Container_Diagram
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+
+title **Container Diagram - Decoration Preview Service (AWS Architecture)**
+
+skinparam rectangle {
+    BackgroundColor<<person>> #08427B
+    FontColor<<person>> #FFFFFF
+    BorderColor<<person>> #073B6F
+    BackgroundColor<<container>> #438DD5
+    FontColor<<container>> #FFFFFF
+    BorderColor<<container>> #3C7FC0
+    BackgroundColor<<database>> #438DD5
+    FontColor<<database>> #FFFFFF
+    BorderColor<<database>> #3C7FC0
+    BackgroundColor<<queue>> #438DD5
+    FontColor<<queue>> #FFFFFF
+    BorderColor<<queue>> #3C7FC0
+    BackgroundColor<<external>> #999999
+    FontColor<<external>> #FFFFFF
+    BorderColor<<external>> #8A8A8A
+}
+
+rectangle "**Graphic Designer**" <<person>> as designer
+
+package "AWS Cloud (eu-central-1)" <<Frame>> {
+    rectangle "**CloudFront CDN**\n\nCaches rendered previews,\nTLS termination, WAF" <<container>> as cdn
+
+    rectangle "**Application Load Balancer**\n\nRequest routing,\nrate limiting,\nhealth checks" <<container>> as alb
+
+    rectangle "**API Service**\n[Python / FastAPI on ECS Fargate]\n\nREST API endpoints,\nfile validation,\njob management" <<container>> as api
+
+    rectangle "**Render Queue**\n[AWS SQS]\n\nAsync job queue\nwith DLQ" <<queue>> as sqs
+
+    rectangle "**Render Worker**\n[Python / Blender on ECS Fargate]\n\n3D rendering engine,\nauto-scales 0-50 tasks" <<container>> as worker
+
+    database "**Jobs Database**\n[AWS DynamoDB]\n\nJob metadata,\nstatus tracking" <<database>> as dynamo
+
+    rectangle "**Artwork Storage**\n[AWS S3 + KMS]\n\nEncrypted artwork\nuploads" <<database>> as artwork_s3
+
+    rectangle "**Element Models**\n[AWS S3 + KMS]\n\n3D element models" <<database>> as elements_s3
+
+    rectangle "**Preview Storage**\n[AWS S3 + KMS]\n\nRendered preview\nimages" <<database>> as renders_s3
+
+    rectangle "**Monitoring**\n[CloudWatch + SNS]\n\nDashboards, alarms,\nlogs" <<container>> as monitoring
+}
+
+rectangle "**Corporate IdP**" <<external>> as auth
+
+designer --> cdn : "HTTPS"
+cdn --> alb : "HTTPS"
+alb --> api : "HTTP/8000"
+api --> sqs : "Enqueues jobs"
+api --> dynamo : "Read/Write jobs"
+api --> artwork_s3 : "Store artwork"
+sqs --> worker : "Long polling"
+worker --> artwork_s3 : "Download artwork"
+worker --> elements_s3 : "Load 3D models"
+worker --> renders_s3 : "Store previews"
+worker --> dynamo : "Update status"
+api --> auth : "Validate tokens"
+cdn --> renders_s3 : "Serve cached previews"
+api --> monitoring : "Metrics & logs"
+
+center footer Decoration Preview Service - Container Diagram | C4 Model
+
+@enduml

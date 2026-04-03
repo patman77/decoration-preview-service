@@ -1,0 +1,24 @@
+@startuml C4_Context_Diagram
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Context.puml
+
+title System Context Diagram - Decoration Preview Service
+
+Person(designer, "Graphic Designer", "Creates 2D decoration artwork\nfor toy elements")
+Person(manager, "Design Manager", "Reviews decoration previews\nand approves designs")
+
+System(dps, "Decoration Preview Service", "Accepts 2D artwork files and\nelement identifiers, renders\n3D preview images showing how\ndecorations will appear on\nphysical toy elements")
+
+System_Ext(dam, "Digital Asset\nManagement", "Stores approved artwork\nand element designs")
+System_Ext(plm, "Product Lifecycle\nManagement", "Manages element catalog\nand product data")
+System_Ext(auth, "Corporate Identity\nProvider", "SSO authentication\nvia SAML/OIDC")
+System_Ext(email, "Email / Notification\nService", "Sends completion\nnotifications")
+
+Rel(designer, dps, "Uploads artwork,\nrequests previews", "HTTPS/REST API")
+Rel(manager, dps, "Reviews rendered\npreviews", "HTTPS/Web UI")
+Rel(dps, dam, "Retrieves approved\nartwork templates", "REST API")
+Rel(dps, plm, "Fetches element\ncatalog & 3D models", "REST API")
+Rel(dps, auth, "Authenticates users", "SAML 2.0 / OIDC")
+Rel(dps, email, "Sends render\ncomplete notifications", "SMTP/API")
+
+LAYOUT_WITH_LEGEND()
+@enduml

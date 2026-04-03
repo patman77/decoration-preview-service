@@ -1,0 +1,49 @@
+@startuml C4_Container_Diagram
+!include https://raw.githubusercontent.com/plantuml-stdlib/C4-PlantUML/master/C4_Container.puml
+
+title Container Diagram - Decoration Preview Service (AWS Architecture)
+
+Person(designer, "Graphic Designer", "Uploads artwork and\nreviews previews")
+
+System_Boundary(aws, "AWS Cloud (eu-central-1)") {
+
+    Container(cdn, "CloudFront CDN", "AWS CloudFront", "Caches rendered previews,\nterminates TLS,\nWAF protection")
+
+    Container(apigw, "API Gateway /\nApplication Load Balancer", "AWS ALB", "Routes requests,\nrate limiting,\nhealth checks")
+
+    Container(api, "API Service", "Python / FastAPI\non ECS Fargate", "REST API endpoints,\nfile validation,\njob management,\nauthentication")
+
+    ContainerQueue(sqs, "Render Queue", "AWS SQS", "Async job queue\nwith DLQ for\nfailed renders")
+
+    Container(worker, "Render Worker", "Python / Blender\non ECS Fargate", "3D rendering engine,\nprocesses jobs from queue,\nauto-scales 0-50 tasks")
+
+    ContainerDb(dynamo, "Jobs Database", "AWS DynamoDB", "Render job metadata,\nstatus tracking,\nTTL-based cleanup")
+
+    Container(artwork_s3, "Artwork Storage", "AWS S3 + KMS", "Encrypted artwork\nuploads with versioning\nand lifecycle policies")
+
+    Container(elements_s3, "Element Models", "AWS S3 + KMS", "3D element models\nand reference data")
+
+    Container(renders_s3, "Preview Storage", "AWS S3 + KMS", "Rendered preview images\nwith 30-day expiry")
+
+    Container(monitoring, "Monitoring", "CloudWatch + SNS", "Dashboards, alarms,\nlogs, and alerts")
+}
+
+System_Ext(auth, "Corporate IdP", "Authentication")
+
+Rel(designer, cdn, "Uploads artwork,\ndownloads previews", "HTTPS")
+Rel(cdn, apigw, "Routes API requests", "HTTPS")
+Rel(apigw, api, "Forwards requests", "HTTP/8000")
+Rel(api, sqs, "Enqueues render jobs", "AWS SDK")
+Rel(api, dynamo, "Creates/reads\njob records", "AWS SDK")
+Rel(api, artwork_s3, "Stores uploaded\nartwork", "AWS SDK")
+Rel(sqs, worker, "Delivers render\njobs", "Long polling")
+Rel(worker, artwork_s3, "Downloads artwork", "AWS SDK")
+Rel(worker, elements_s3, "Loads 3D models", "AWS SDK")
+Rel(worker, renders_s3, "Stores rendered\npreviews", "AWS SDK")
+Rel(worker, dynamo, "Updates job status", "AWS SDK")
+Rel(api, auth, "Validates tokens", "OIDC")
+Rel(api, monitoring, "Emits metrics\nand logs", "CloudWatch API")
+Rel(cdn, renders_s3, "Serves cached\npreviews", "S3 Origin")
+
+LAYOUT_WITH_LEGEND()
+@enduml

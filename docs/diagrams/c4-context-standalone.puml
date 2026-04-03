@@ -1,0 +1,39 @@
+@startuml C4_Context_Diagram
+
+skinparam backgroundColor #FFFFFF
+skinparam defaultFontName "DejaVu Sans"
+
+title **System Context Diagram - Decoration Preview Service**
+
+skinparam rectangle {
+    BackgroundColor<<person>> #08427B
+    FontColor<<person>> #FFFFFF
+    BorderColor<<person>> #073B6F
+    BackgroundColor<<system>> #1168BD
+    FontColor<<system>> #FFFFFF
+    BorderColor<<system>> #0B4884
+    BackgroundColor<<external>> #999999
+    FontColor<<external>> #FFFFFF
+    BorderColor<<external>> #8A8A8A
+}
+
+rectangle "**Graphic Designer**\n\nCreates 2D decoration\nartwork for toy elements" <<person>> as designer
+rectangle "**Design Manager**\n\nReviews decoration previews\nand approves designs" <<person>> as manager
+
+rectangle "**Decoration Preview Service**\n\nAccepts 2D artwork files and\nelement identifiers, renders\n3D preview images" <<system>> as dps
+
+rectangle "**Digital Asset Management**\n\nStores approved artwork\nand element designs" <<external>> as dam
+rectangle "**Product Lifecycle Mgmt**\n\nManages element catalog\nand product data" <<external>> as plm
+rectangle "**Corporate Identity Provider**\n\nSSO authentication\nvia SAML/OIDC" <<external>> as auth
+rectangle "**Notification Service**\n\nSends completion\nnotifications" <<external>> as email
+
+designer -down-> dps : "Uploads artwork,\nrequests previews\n[HTTPS/REST API]"
+manager -down-> dps : "Reviews rendered\npreviews\n[HTTPS/Web UI]"
+dps -down-> dam : "Retrieves approved\nartwork templates\n[REST API]"
+dps -down-> plm : "Fetches element\ncatalog & 3D models\n[REST API]"
+dps -right-> auth : "Authenticates\nusers\n[SAML 2.0/OIDC]"
+dps -down-> email : "Sends render\ncomplete notifications\n[SMTP/API]"
+
+center footer Decoration Preview Service - System Context | C4 Model
+
+@enduml
