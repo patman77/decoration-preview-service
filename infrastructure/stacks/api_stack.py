@@ -177,13 +177,19 @@ class ApiStack(cdk.Stack):
             enabled=True,
         )
 
-        # --- WAF WebACL ---
+        # --- WAF WebACL (REGIONAL scope — protects the ALB) ---
+        # NOTE: CloudFront WAF ACLs require CLOUDFRONT scope and MUST be
+        # created in us-east-1.  Since this stack may be deployed to any
+        # region, we use REGIONAL scope and attach the ACL to the ALB.
+        # To add CloudFront-level WAF protection, create a separate stack
+        # in us-east-1 with scope="CLOUDFRONT" and reference its ARN in
+        # the CloudFront distribution's web_acl_id property.
 
         self.web_acl = waf.CfnWebACL(
             self,
             "ApiWebAcl",
             name="decoration-preview-waf",
-            scope="CLOUDFRONT",
+            scope="REGIONAL",
             default_action=waf.CfnWebACL.DefaultActionProperty(allow={}),
             visibility_config=waf.CfnWebACL.VisibilityConfigProperty(
                 cloud_watch_metrics_enabled=True,
@@ -226,6 +232,14 @@ class ApiStack(cdk.Stack):
                     ),
                 ),
             ],
+        )
+
+        # Associate the WAF WebACL with the ALB
+        waf.CfnWebACLAssociation(
+            self,
+            "ApiWebAclAlbAssociation",
+            resource_arn=self.alb.load_balancer_arn,
+            web_acl_arn=self.web_acl.attr_arn,
         )
 
         # --- Outputs ---

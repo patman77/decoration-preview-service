@@ -255,12 +255,47 @@ Before going live, ensure:
 - [ ] **HTTPS Certificate** — (Recommended) Create an ACM certificate and enable HTTPS (see above)
 - [ ] **Custom Domain** — Configure Route 53 or your DNS to point to CloudFront/ALB
 - [ ] **Alert Subscription** — Subscribe your team email to the SNS alerts topic
-- [ ] **WAF Rules** — Review and customize WAF rules for your traffic patterns
+- [ ] **WAF Rules** — Review and customize WAF rules for your traffic patterns (see WAF notes below)
 - [ ] **S3 CORS** — Restrict `allowed_origins` in `storage_stack.py` from `*` to your domain(s)
 - [ ] **Secrets Manager** — Move `API_KEY` to AWS Secrets Manager for rotation support
 - [ ] **Backup Policy** — Verify DynamoDB point-in-time recovery is enabled (it is by default)
 - [ ] **Cost Alerts** — Set up AWS Budgets for cost monitoring
 - [ ] **Logging** — Verify CloudWatch log groups are receiving logs
+
+---
+
+## WAF (Web Application Firewall) Notes
+
+The deployment includes a **REGIONAL** WAF WebACL attached to the Application
+Load Balancer. This protects the ALB (and the ECS services behind it) with:
+
+- **Rate limiting** — 1 000 requests per 5-minute window per IP
+- **AWS Managed Common Rule Set** — blocks known malicious request patterns
+
+### Why not a CloudFront WAF?
+
+AWS WAFv2 WebACLs with `CLOUDFRONT` scope **must** be created in
+**us-east-1**, because CloudFront is a global service. When the stack is
+deployed to any other region (e.g. `eu-central-1`) a `CLOUDFRONT`-scoped ACL
+will fail with:
+
+> *The scope is not valid., field: SCOPE_VALUE, parameter: CLOUDFRONT*
+
+To keep the deployment region-agnostic the WAF uses `REGIONAL` scope and
+protects the ALB directly.
+
+### Adding CloudFront WAF protection later
+
+If you need WAF rules at the CloudFront edge:
+
+1. Create a **separate CDK stack** (or CloudFormation template) that deploys
+   **only** in `us-east-1`.
+2. In that stack create a `CfnWebACL` with `scope="CLOUDFRONT"`.
+3. Pass the WebACL ARN to the main stack and set
+   `web_acl_id=<arn>` on the `cloudfront.Distribution`.
+
+This two-stack pattern is the standard AWS approach for multi-region
+deployments that need CloudFront-level WAF.
 
 ---
 
