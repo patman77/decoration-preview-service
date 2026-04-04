@@ -338,13 +338,76 @@ aws s3 rb s3://decoration-preview-elements-YOUR_ACCOUNT_ID --force
 | `cdk bootstrap` fails | Ensure your IAM user has `AdministratorAccess` or equivalent |
 | Docker build fails | Check Docker daemon is running; ensure `requirements.txt` is in `backend/` |
 | ECS tasks keep restarting | Check CloudWatch logs: `/ecs/decoration-preview/api` |
-| ECS service stuck in CREATE_IN_PROGRESS | See [ECS Service Deployment Hangs](#ecs-service-deployment-hangs) below |
+| ECS service stuck in CREATE_IN_PROGRESS | Run `./deploy.sh cancel-stuck`, then `cleanup`, then redeploy — see [Handling Stacks Stuck in CREATE_IN_PROGRESS](#handling-stacks-stuck-in-create_in_progress) |
 | ALB health check fails | Verify security groups allow port 8000 from ALB |
 | `No space left on device` | Docker disk space; run `docker system prune` |
 | CDK synth import errors | Ensure `aws-cdk-lib` is installed: `pip install -r requirements.txt` |
 | CloudFront 502 errors | ALB may not have healthy targets yet; wait for ECS tasks to start |
 | HTTPS Listener needs certificate | Don't set `CERTIFICATE_ARN` until you have an ACM cert; ALB works fine with HTTP only |
 | WAF scope error (`CLOUDFRONT` in non-us-east-1) | Ensure `api_stack.py` uses `scope="REGIONAL"` — see [WAF Notes](#waf-web-application-firewall-notes) |
+
+### Handling Stacks Stuck in CREATE_IN_PROGRESS
+
+When a CloudFormation stack hangs during creation (e.g. an ECS service waiting
+for tasks to stabilize), it stays in `CREATE_IN_PROGRESS` indefinitely. **You
+cannot update or redeploy a stack in this state** — the deployment will fail with:
+
+> *Stack [name] is in CREATE_IN_PROGRESS state and can not be updated.*
+
+This commonly happens with the `decoration-preview-compute` stack when the ECS
+service (`ApiService/Service`) cannot reach a healthy state.
+
+#### Quick fix — use the cancel-stuck command
+
+```bash
+# 1. Cancel stacks stuck in CREATE_IN_PROGRESS or UPDATE_IN_PROGRESS
+./deploy.sh cancel-stuck
+
+# 2. After rollback completes, clean up the ROLLBACK_COMPLETE stack
+./deploy.sh cleanup
+
+# 3. Redeploy
+./deploy.sh deploy
+```
+
+The `cancel-stuck` command will:
+- Show the last 5 stack events so you can see which resource is stuck
+- For `CREATE_IN_PROGRESS` stacks: offer to **delete** the stack (the only
+  option, since `cancel-update-in-progress` only works for updates)
+- For `UPDATE_IN_PROGRESS` stacks: send a `cancel-update-in-progress` signal
+  to trigger a rollback
+
+#### Manual fix via AWS CLI
+
+```bash
+# 1. Check which stacks are stuck
+aws cloudformation list-stacks \
+  --stack-status-filter CREATE_IN_PROGRESS UPDATE_IN_PROGRESS \
+  --query 'StackSummaries[*].[StackName,StackStatus,CreationTime]' \
+  --output table
+
+# 2a. For CREATE_IN_PROGRESS — delete the stack
+aws cloudformation delete-stack --stack-name decoration-preview-compute
+aws cloudformation wait stack-delete-complete --stack-name decoration-preview-compute
+
+# 2b. For UPDATE_IN_PROGRESS — cancel the update
+aws cloudformation cancel-update-in-progress --stack-name decoration-preview-compute
+# Wait for it to reach UPDATE_ROLLBACK_COMPLETE
+
+# 3. Redeploy
+./deploy.sh deploy
+```
+
+#### Preventing future stuck deployments
+
+- **Fix the root cause first**: before redeploying, check why the ECS tasks
+  failed (see [ECS Service Deployment Hangs](#ecs-service-deployment-hangs))
+- **Test locally**: `docker build -t test backend/ && docker run -p 8000:8000 test`
+  then `curl localhost:8000/health`
+- **Use `./deploy.sh ecs-status`** in a second terminal to monitor task health
+  during deployment
+
+---
 
 ### Handling Stacks in ROLLBACK_COMPLETE State
 
