@@ -2,16 +2,12 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install only curl (needed for health check) – no other system deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
-    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for layer caching
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
+# NO pip install – we use ZERO external Python packages
 # Copy application code
 COPY . /app/backend/
 
@@ -23,11 +19,10 @@ RUN useradd -m appuser && chown -R appuser:appuser /app /tmp/rendered
 USER appuser
 
 # Health check — generous start-period so Fargate doesn't kill the task
-# while Python is still loading heavy dependencies (Pillow, boto3, etc.)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=90s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD curl -f http://localhost:8000/health || exit 1
 
 EXPOSE 8000
 
-# --log-level info ensures startup messages (including errors) reach CloudWatch
-CMD ["uvicorn", "backend.app.main:app", "--host", "0.0.0.0", "--port", "8000", "--log-level", "info"]
+# Run the minimal stdlib HTTP server directly
+CMD ["python", "-m", "backend.app.main"]
