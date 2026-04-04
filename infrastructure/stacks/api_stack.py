@@ -4,6 +4,8 @@ Configures the public-facing API infrastructure with
 authentication, rate limiting, and CDN caching.
 """
 
+import os
+
 import aws_cdk as cdk
 from aws_cdk import (
     Duration,
@@ -28,6 +30,12 @@ class ApiStack(cdk.Stack):
     - CloudFront CDN for caching rendered previews
     - WAF for DDoS protection and request filtering
     - API usage plans and rate limiting
+
+    HTTPS is optional. Set the CERTIFICATE_ARN environment variable or
+    the ``certificate_arn`` CDK context value to an ACM certificate ARN
+    to enable HTTPS on the ALB.  When no certificate is configured the
+    ALB serves traffic over HTTP only and CloudFront connects to the
+    origin via HTTP.
     """
 
     def __init__(
@@ -41,6 +49,15 @@ class ApiStack(cdk.Stack):
     ) -> None:
         super().__init__(scope, construct_id, **kwargs)
 
+        # --- Resolve optional certificate ARN ---
+        # Priority: environment variable > CDK context
+        certificate_arn: str | None = (
+            os.environ.get("CERTIFICATE_ARN")
+            or self.node.try_get_context("certificate_arn")
+            or None
+        )
+        has_certificate = bool(certificate_arn)
+
         # --- Application Load Balancer ---
 
         self.alb = elbv2.ApplicationLoadBalancer(
@@ -51,33 +68,57 @@ class ApiStack(cdk.Stack):
             internet_facing=True,
         )
 
-        # HTTP listener (redirects to HTTPS)
-        self.alb.add_listener(
-            "HttpListener",
-            port=80,
-            default_action=elbv2.ListenerAction.redirect(
-                protocol="HTTPS",
-                port="443",
-                permanent=True,
-            ),
-        )
+        if has_certificate:
+            # --- HTTPS mode ---
+            # HTTP listener redirects to HTTPS
+            self.alb.add_listener(
+                "HttpListener",
+                port=80,
+                default_action=elbv2.ListenerAction.redirect(
+                    protocol="HTTPS",
+                    port="443",
+                    permanent=True,
+                ),
+            )
 
-        # HTTPS listener
-        # NOTE: In production, attach an ACM certificate
-        https_listener = self.alb.add_listener(
-            "HttpsListener",
-            port=443,
-            protocol=elbv2.ApplicationProtocol.HTTPS,
-            # certificate: Use acm.Certificate in production
-            default_action=elbv2.ListenerAction.fixed_response(
-                status_code=404,
-                content_type="application/json",
-                message_body='{"detail": "Not found"}',
-            ),
-        )
+            # Import the ACM certificate
+            certificate = acm.Certificate.from_certificate_arn(
+                self, "AlbCertificate", certificate_arn
+            )
 
-        # Target group for API service
-        api_target_group = https_listener.add_targets(
+            # HTTPS listener with certificate
+            primary_listener = self.alb.add_listener(
+                "HttpsListener",
+                port=443,
+                protocol=elbv2.ApplicationProtocol.HTTPS,
+                certificates=[certificate],
+                default_action=elbv2.ListenerAction.fixed_response(
+                    status_code=404,
+                    content_type="application/json",
+                    message_body='{"detail": "Not found"}',
+                ),
+            )
+
+            # CloudFront talks HTTPS to ALB
+            origin_protocol = cloudfront.OriginProtocolPolicy.HTTPS_ONLY
+        else:
+            # --- HTTP-only mode (no certificate) ---
+            # HTTP listener forwards traffic directly to the API
+            primary_listener = self.alb.add_listener(
+                "HttpListener",
+                port=80,
+                default_action=elbv2.ListenerAction.fixed_response(
+                    status_code=404,
+                    content_type="application/json",
+                    message_body='{"detail": "Not found"}',
+                ),
+            )
+
+            # CloudFront talks HTTP to ALB (no TLS on origin)
+            origin_protocol = cloudfront.OriginProtocolPolicy.HTTP_ONLY
+
+        # Target group for API service (attached to whichever listener is primary)
+        api_target_group = primary_listener.add_targets(
             "ApiTargets",
             port=8000,
             protocol=elbv2.ApplicationProtocol.HTTP,
@@ -96,7 +137,6 @@ class ApiStack(cdk.Stack):
 
         # --- CloudFront Distribution ---
 
-        # Origin Access Identity for S3
         self.distribution = cloudfront.Distribution(
             self,
             "CdnDistribution",
@@ -104,7 +144,7 @@ class ApiStack(cdk.Stack):
             default_behavior=cloudfront.BehaviorOptions(
                 origin=origins.LoadBalancerV2Origin(
                     self.alb,
-                    protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+                    protocol_policy=origin_protocol,
                 ),
                 viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                 cache_policy=cloudfront.CachePolicy.CACHING_DISABLED,
@@ -115,7 +155,7 @@ class ApiStack(cdk.Stack):
                 "/api/v1/render/*/download*": cloudfront.BehaviorOptions(
                     origin=origins.LoadBalancerV2Origin(
                         self.alb,
-                        protocol_policy=cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+                        protocol_policy=origin_protocol,
                     ),
                     viewer_protocol_policy=cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
                     cache_policy=cloudfront.CachePolicy(
@@ -193,4 +233,10 @@ class ApiStack(cdk.Stack):
         cdk.CfnOutput(self, "AlbDnsName", value=self.alb.load_balancer_dns_name)
         cdk.CfnOutput(
             self, "CloudFrontDomain", value=self.distribution.distribution_domain_name
+        )
+        cdk.CfnOutput(
+            self,
+            "AlbProtocol",
+            value="HTTPS" if has_certificate else "HTTP",
+            description="Protocol used by the ALB primary listener",
         )

@@ -212,12 +212,47 @@ curl -X POST "${SERVICE_URL}/api/v1/render" \
 
 ---
 
+## Adding HTTPS / SSL Certificate (Optional)
+
+By default the ALB is deployed in **HTTP-only** mode so you can get started without
+a certificate. CloudFront still serves end-user traffic over HTTPS — the HTTP-only
+part is only the connection between CloudFront and the ALB (within AWS).
+
+When you're ready to add TLS to the ALB:
+
+1. **Request an ACM certificate** in the same region as your deployment:
+   ```bash
+   aws acm request-certificate \
+     --domain-name your-domain.com \
+     --validation-method DNS \
+     --region eu-central-1
+   ```
+2. **Validate the certificate** by adding the CNAME records that ACM provides (see the
+   AWS Console → Certificate Manager → your certificate → "Create records in Route 53").
+3. **Set the certificate ARN** before deploying:
+   ```bash
+   # Option A: Environment variable
+   export CERTIFICATE_ARN="arn:aws:acm:eu-central-1:123456789012:certificate/abc-123"
+
+   # Option B: CDK context in infrastructure/cdk.json
+   # Add "certificate_arn": "arn:aws:acm:..." inside the "context" block
+   ```
+4. **Re-deploy** the API stack:
+   ```bash
+   ./deploy.sh deploy
+   ```
+
+After redeployment the ALB will serve HTTPS on port 443 and the HTTP listener
+will redirect to HTTPS automatically.
+
+---
+
 ## Production Checklist
 
 Before going live, ensure:
 
 - [ ] **API Key** — Generated and set to a strong secret (not the dev default)
-- [ ] **HTTPS Certificate** — Create an ACM certificate and attach to the ALB HTTPS listener
+- [ ] **HTTPS Certificate** — (Recommended) Create an ACM certificate and enable HTTPS (see above)
 - [ ] **Custom Domain** — Configure Route 53 or your DNS to point to CloudFront/ALB
 - [ ] **Alert Subscription** — Subscribe your team email to the SNS alerts topic
 - [ ] **WAF Rules** — Review and customize WAF rules for your traffic patterns
@@ -272,3 +307,4 @@ aws s3 rb s3://decoration-preview-elements-YOUR_ACCOUNT_ID --force
 | `No space left on device` | Docker disk space; run `docker system prune` |
 | CDK synth import errors | Ensure `aws-cdk-lib` is installed: `pip install -r requirements.txt` |
 | CloudFront 502 errors | ALB may not have healthy targets yet; wait for ECS tasks to start |
+| HTTPS Listener needs certificate | Don't set `CERTIFICATE_ARN` until you have an ACM cert; ALB works fine with HTTP only |
