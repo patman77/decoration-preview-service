@@ -13,6 +13,7 @@
 #   destroy    - Destroy all stacks (CAUTION!)
 #   cleanup    - Delete stacks stuck in ROLLBACK_COMPLETE state
 #   status     - Show deployment status and stack outputs
+#   ecs-status - Show ECS service and task status (useful during deploys)
 #   diff       - Show pending changes before deploy
 # ============================================================
 
@@ -296,6 +297,11 @@ cmd_deploy() {
     log_info "Deploying all stacks to AWS (${AWS_REGION})..."
     echo ""
     log_warn "This will create/update AWS resources and may incur charges."
+    log_info "ECS service creation can take 5-10 minutes. If it seems stuck:"
+    log_info "  - Open another terminal and run: ./deploy.sh ecs-status"
+    log_info "  - Check CloudWatch logs: /ecs/decoration-preview/api"
+    log_info "  - Deployment circuit breaker will auto-rollback on repeated failures."
+    echo ""
     read -rp "Continue? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then
         log_info "Deployment cancelled."
@@ -352,6 +358,88 @@ cmd_status() {
     done
 }
 
+# ── ECS Status ──────────────────────────────────────────────
+cmd_ecs_status() {
+    local cluster="decoration-preview-cluster"
+    local region="${AWS_REGION}"
+
+    echo ""
+    log_info "ECS Cluster: ${cluster} (${region})"
+    echo ""
+
+    # Show ECS services
+    echo -e "${BLUE}── ECS Services ──${NC}"
+    for service in decoration-preview-api decoration-preview-render; do
+        echo -e "\n${CYAN}Service: ${service}${NC}"
+        aws ecs describe-services \
+            --cluster "${cluster}" \
+            --services "${service}" \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Pending:pendingCount,Deployments:deployments[*].{Status:status,Running:runningCount,Desired:desiredCount,Rollout:rolloutState,Reason:rolloutStateReason}}' \
+            --output yaml \
+            --region "${region}" 2>/dev/null || echo "  (service not found — stack may not be deployed yet)"
+    done
+
+    echo ""
+
+    # Show recent task status
+    echo -e "${BLUE}── Recent Tasks ──${NC}"
+    local task_arns
+    task_arns=$(aws ecs list-tasks \
+        --cluster "${cluster}" \
+        --query 'taskArns[*]' \
+        --output text \
+        --region "${region}" 2>/dev/null) || true
+
+    if [ -n "${task_arns}" ] && [ "${task_arns}" != "None" ]; then
+        aws ecs describe-tasks \
+            --cluster "${cluster}" \
+            --tasks ${task_arns} \
+            --query 'tasks[*].{TaskArn:taskArn,Status:lastStatus,DesiredStatus:desiredStatus,StopReason:stoppedReason,Health:healthStatus,StartedAt:startedAt,Group:group}' \
+            --output table \
+            --region "${region}" 2>/dev/null || echo "  (could not describe tasks)"
+    else
+        log_warn "No running tasks found in cluster."
+    fi
+
+    # Show recently stopped tasks (failures)
+    echo ""
+    echo -e "${BLUE}── Recently Stopped Tasks (last failures) ──${NC}"
+    local stopped_arns
+    stopped_arns=$(aws ecs list-tasks \
+        --cluster "${cluster}" \
+        --desired-status STOPPED \
+        --query 'taskArns[0:5]' \
+        --output text \
+        --region "${region}" 2>/dev/null) || true
+
+    if [ -n "${stopped_arns}" ] && [ "${stopped_arns}" != "None" ]; then
+        aws ecs describe-tasks \
+            --cluster "${cluster}" \
+            --tasks ${stopped_arns} \
+            --query 'tasks[*].{TaskArn:taskArn,Status:lastStatus,StopCode:stopCode,StopReason:stoppedReason,StartedAt:startedAt,StoppedAt:stoppedAt,Group:group}' \
+            --output table \
+            --region "${region}" 2>/dev/null || echo "  (could not describe stopped tasks)"
+    else
+        log_info "No recently stopped tasks."
+    fi
+
+    echo ""
+    log_info "Useful commands for further debugging:"
+    echo "  # View API container logs:"
+    echo "  aws logs tail /ecs/decoration-preview/api --follow --region ${region}"
+    echo ""
+    echo "  # View render worker logs:"
+    echo "  aws logs tail /ecs/decoration-preview/render --follow --region ${region}"
+    echo ""
+    echo "  # ECS Exec into a running task (requires enable_execute_command=True):"
+    echo "  aws ecs execute-command --cluster ${cluster} --task <TASK_ID> \\"
+    echo "    --container ApiContainer --interactive --command '/bin/sh' --region ${region}"
+    echo ""
+    echo "  # View ECS service events (shows deployment issues):"
+    echo "  aws ecs describe-services --cluster ${cluster} --services decoration-preview-api \\"
+    echo "    --query 'services[0].events[0:10]' --output table --region ${region}"
+}
+
 # ── Main ───────────────────────────────────────────────────
 case "${1:-help}" in
     bootstrap)
@@ -388,6 +476,9 @@ case "${1:-help}" in
     status)
         cmd_status
         ;;
+    ecs-status)
+        cmd_ecs_status
+        ;;
     help|*)
         echo "Decoration Preview Service - AWS Deployment"
         echo ""
@@ -402,6 +493,7 @@ case "${1:-help}" in
         echo "  destroy          Destroy all stacks (CAUTION!)"
         echo "  cleanup          Delete failed stacks (ROLLBACK_COMPLETE)"
         echo "  status           Show deployment outputs"
+        echo "  ecs-status       Show ECS service/task status (debug deploys)"
         echo "  help             Show this help message"
         ;;
 esac

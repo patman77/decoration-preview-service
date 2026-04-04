@@ -338,6 +338,7 @@ aws s3 rb s3://decoration-preview-elements-YOUR_ACCOUNT_ID --force
 | `cdk bootstrap` fails | Ensure your IAM user has `AdministratorAccess` or equivalent |
 | Docker build fails | Check Docker daemon is running; ensure `requirements.txt` is in `backend/` |
 | ECS tasks keep restarting | Check CloudWatch logs: `/ecs/decoration-preview/api` |
+| ECS service stuck in CREATE_IN_PROGRESS | See [ECS Service Deployment Hangs](#ecs-service-deployment-hangs) below |
 | ALB health check fails | Verify security groups allow port 8000 from ALB |
 | `No space left on device` | Docker disk space; run `docker system prune` |
 | CDK synth import errors | Ensure `aws-cdk-lib` is installed: `pip install -r requirements.txt` |
@@ -393,3 +394,78 @@ dependency order** (top-level first):
 
 > **Tip:** The `./deploy.sh cleanup` command already processes stacks in this
 > order and prompts you before deleting each one.
+
+### ECS Service Deployment Hangs
+
+During `decoration-preview-compute` stack deployment, the ECS service
+(`ApiService/Service`) may appear stuck at `CREATE_IN_PROGRESS` for an
+extended period. This happens when ECS tasks fail to reach a healthy state.
+
+#### Quick diagnosis
+
+Open a **second terminal** and run:
+
+```bash
+# Real-time ECS service and task status
+./deploy.sh ecs-status
+```
+
+This shows running/pending/stopped tasks, deployment rollout state, and stop
+reasons for failed tasks.
+
+#### Common causes and solutions
+
+| Cause | Symptoms | Fix |
+|-------|----------|-----|
+| **Docker image build failure** | No tasks start; CDK output shows Docker build errors | Fix `backend/Dockerfile` or `requirements.txt` and redeploy |
+| **Container crashes on startup** | Tasks start then immediately stop (`Essential container exited`) | Check logs: `aws logs tail /ecs/decoration-preview/api --follow` |
+| **Health check fails** | Tasks run but are marked `UNHEALTHY` | Verify `/health` endpoint works locally: `docker build -t test ../backend && docker run -p 8000:8000 test` then `curl localhost:8000/health` |
+| **IAM permission issues** | Tasks stop with `CannotPullContainerError` | Ensure ECS task execution role has ECR pull permissions (CDK handles this, but check if customized) |
+| **Subnet/NAT issues** | Tasks stay in `PROVISIONING` | Verify NAT Gateway is healthy and private subnets have routes to it |
+| **Resource limits** | Tasks killed with `OutOfMemoryError` | Increase `memory_limit_mib` in `compute_stack.py` |
+
+#### Step-by-step debugging
+
+```bash
+# 1. Check ECS service events (shows why tasks are failing)
+aws ecs describe-services \
+  --cluster decoration-preview-cluster \
+  --services decoration-preview-api \
+  --query 'services[0].events[0:10]' \
+  --output table --region eu-central-1
+
+# 2. View container logs for the API service
+aws logs tail /ecs/decoration-preview/api --follow --region eu-central-1
+
+# 3. List stopped (failed) tasks and see their stop reasons
+aws ecs list-tasks --cluster decoration-preview-cluster \
+  --desired-status STOPPED --output text --region eu-central-1 | \
+  xargs -r aws ecs describe-tasks --cluster decoration-preview-cluster \
+  --query 'tasks[*].{Task:taskArn,StopCode:stopCode,Reason:stoppedReason}' \
+  --output table --tasks --region eu-central-1
+
+# 4. Check ECS task definition is using the right image
+aws ecs describe-task-definition --task-definition decoration-preview-api \
+  --query 'taskDefinition.containerDefinitions[0].image' --output text \
+  --region eu-central-1
+
+# 5. ECS Exec into a running task for live debugging
+aws ecs execute-command \
+  --cluster decoration-preview-cluster \
+  --task <TASK_ARN> \
+  --container ApiContainer \
+  --interactive \
+  --command '/bin/sh' \
+  --region eu-central-1
+```
+
+#### Circuit breaker protection
+
+The ECS services are configured with a **deployment circuit breaker** that
+automatically detects repeated task failures and rolls back the deployment.
+This prevents indefinite hangs — if tasks keep crashing, the deployment will
+fail and CloudFormation will report an error instead of waiting forever.
+
+If you see `ROLLBACK` in the circuit breaker status, the tasks are failing
+consistently. Check the container logs to find the root cause before
+redeploying.
