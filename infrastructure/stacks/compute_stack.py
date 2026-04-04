@@ -100,9 +100,9 @@ class ComputeStack(cdk.Stack):
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
                 interval=Duration.seconds(30),
-                timeout=Duration.seconds(5),
+                timeout=Duration.seconds(10),
                 retries=3,
-                start_period=Duration.seconds(60),
+                start_period=Duration.seconds(120),
             ),
         )
 
@@ -184,7 +184,7 @@ class ComputeStack(cdk.Stack):
                 rollback=True,  # Auto-rollback on repeated failures
             ),
             # Give tasks time to pass health checks before being killed
-            health_check_grace_period=Duration.seconds(120),
+            health_check_grace_period=Duration.seconds(180),
             # Use deployment alarms for faster failure detection
             enable_execute_command=True,  # Allow ECS Exec for debugging
         )

@@ -8,7 +8,10 @@ Configures the application with:
 - OpenAPI documentation
 """
 
+import logging
 import os
+import sys
+import traceback
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import AsyncGenerator
@@ -18,19 +21,53 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from backend.app.api.routes import router as api_router
 from backend.app.core.config import get_settings
-from backend.app.core.exceptions import (
-    ElementNotFoundError,
-    FileValidationError,
-    RenderJobNotFoundError,
-    element_not_found_handler,
-    file_validation_handler,
-    generic_exception_handler,
-    render_job_not_found_handler,
-)
 from backend.app.core.logging import get_logger, setup_logging
 from backend.app.models.schemas import HealthResponse, ServiceInfoResponse
+
+# Set up a bootstrap logger immediately so any import errors are visible
+# in CloudWatch before the full logging configuration runs.
+_bootstrap_logger = logging.getLogger("decoration_preview.bootstrap")
+_bootstrap_handler = logging.StreamHandler(sys.stdout)
+_bootstrap_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s")
+)
+_bootstrap_logger.addHandler(_bootstrap_handler)
+_bootstrap_logger.setLevel(logging.INFO)
+
+# Defer heavy / side-effect-laden imports so that a failure in one
+# sub-module does not prevent the health-check endpoint from loading.
+_api_router = None
+_exception_handlers_loaded = False
+
+try:
+    from backend.app.api.routes import router as api_router
+
+    _api_router = api_router
+    _bootstrap_logger.info("API routes imported successfully")
+except Exception:
+    _bootstrap_logger.error(
+        "Failed to import API routes – the /health endpoint will still work "
+        "but all /api/v1/* routes will be unavailable:\n%s",
+        traceback.format_exc(),
+    )
+
+try:
+    from backend.app.core.exceptions import (
+        ElementNotFoundError,
+        FileValidationError,
+        RenderJobNotFoundError,
+        element_not_found_handler,
+        file_validation_handler,
+        generic_exception_handler,
+        render_job_not_found_handler,
+    )
+
+    _exception_handlers_loaded = True
+except Exception:
+    _bootstrap_logger.error(
+        "Failed to import exception handlers:\n%s", traceback.format_exc()
+    )
 
 
 @asynccontextmanager
@@ -38,8 +75,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan handler for startup/shutdown events."""
     # Startup
     logger = setup_logging()
+    settings = get_settings()
     logger.info("Decoration Preview Service starting up...")
-    logger.info("Environment: %s", get_settings().environment)
+    logger.info("Environment: %s", settings.environment)
+    logger.info("Python: %s", sys.version)
+    logger.info("Working directory: %s", os.getcwd())
+    logger.info("API routes loaded: %s", _api_router is not None)
+    logger.info("Exception handlers loaded: %s", _exception_handlers_loaded)
+
+    # Log environment variables (redact sensitive values)
+    for key in sorted(os.environ):
+        if any(s in key.upper() for s in ("KEY", "SECRET", "PASSWORD", "TOKEN")):
+            logger.info("  env %s = [REDACTED]", key)
+        elif key.startswith(("AWS_", "ENVIRONMENT", "LOG_LEVEL", "ARTWORK_", "ELEMENTS_", "RENDERS_", "JOBS_", "RENDER_QUEUE")):
+            logger.info("  env %s = %s", key, os.environ[key])
     yield
     # Shutdown
     logger.info("Decoration Preview Service shutting down...")
@@ -77,14 +126,20 @@ def create_app() -> FastAPI:
         expose_headers=["X-Request-ID"],
     )
 
-    # Exception handlers
-    app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
-    app.add_exception_handler(FileValidationError, file_validation_handler)
-    app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
-    app.add_exception_handler(Exception, generic_exception_handler)
+    # Exception handlers (only if the import succeeded)
+    if _exception_handlers_loaded:
+        app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
+        app.add_exception_handler(FileValidationError, file_validation_handler)
+        app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
+        app.add_exception_handler(Exception, generic_exception_handler)
 
-    # Include API routes
-    app.include_router(api_router)
+    # Include API routes (only if the import succeeded)
+    if _api_router is not None:
+        app.include_router(_api_router)
+    else:
+        _bootstrap_logger.warning(
+            "API routes not loaded – only /health and / endpoints are available"
+        )
 
     # Root endpoint (no auth required)
     @app.get(
@@ -145,5 +200,37 @@ def create_app() -> FastAPI:
     return app
 
 
-# Application instance
-app = create_app()
+# Application instance — wrapped so that even a catastrophic error during
+# factory execution still produces a running app with a /health endpoint
+# that returns 503, giving operators CloudWatch visibility.
+try:
+    app = create_app()
+    _bootstrap_logger.info("Application created successfully")
+except Exception:
+    _bootstrap_logger.critical(
+        "FATAL: create_app() failed – creating minimal fallback app:\n%s",
+        traceback.format_exc(),
+    )
+
+    # Minimal fallback app that only serves /health so the failure is
+    # visible in ECS task logs and doesn't trigger an immediate OOM-like
+    # silent exit.
+    app = FastAPI(title="Decoration Preview Service (DEGRADED)")
+
+    @app.get("/health")
+    async def _fallback_health():
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "version": "unknown",
+                "environment": os.environ.get("ENVIRONMENT", "unknown"),
+                "error": "Application failed to initialise – check logs",
+            },
+        )
+
+    @app.get("/")
+    async def _fallback_root():
+        return {"status": "degraded", "error": "Application failed to initialise"}

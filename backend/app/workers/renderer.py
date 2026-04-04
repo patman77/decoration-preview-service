@@ -29,9 +29,41 @@ from backend.app.services.job_store import JobRecord, job_store
 
 logger = get_logger(__name__)
 
-# Directory for rendered output (local dev; S3 in production)
-RENDER_OUTPUT_DIR = Path("rendered")
-RENDER_OUTPUT_DIR.mkdir(exist_ok=True)
+
+def _get_render_output_dir() -> Path:
+    """Return (and lazily create) the render output directory.
+
+    Uses /tmp/rendered in containerised environments (always writable)
+    and falls back to a ``rendered/`` directory relative to the
+    working directory for local development.
+    """
+    # Prefer /tmp in containers – it is always writable regardless of
+    # the user the process runs as or root-filesystem permissions.
+    for candidate in (Path("/tmp/rendered"), Path("rendered")):
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+        except OSError as exc:
+            logger.warning(
+                "Could not create render output dir %s: %s", candidate, exc
+            )
+    # Ultimate fallback – use /tmp directly
+    fallback = Path("/tmp")
+    logger.warning("Using bare /tmp as render output directory")
+    return fallback
+
+
+# Lazily initialised on first use so that a directory-creation failure
+# at module-import time does not prevent the API service from starting.
+RENDER_OUTPUT_DIR: Path | None = None
+
+
+def get_render_output_dir() -> Path:
+    """Return the render output directory, initialising it on first call."""
+    global RENDER_OUTPUT_DIR
+    if RENDER_OUTPUT_DIR is None:
+        RENDER_OUTPUT_DIR = _get_render_output_dir()
+    return RENDER_OUTPUT_DIR
 
 
 def _create_element_base(width: int, height: int, element_id: str) -> Image.Image:
@@ -245,7 +277,7 @@ async def process_render_job(
             result = result.convert("RGB")
 
         output_filename = f"{job_id}.{job.output_format}"
-        output_path = RENDER_OUTPUT_DIR / output_filename
+        output_path = get_render_output_dir() / output_filename
 
         save_kwargs = {}
         if output_format == "PNG":
@@ -264,7 +296,7 @@ async def process_render_job(
         thumbnail = result.copy()
         thumbnail.thumbnail((256, 256), Image.Resampling.LANCZOS)
         thumb_filename = f"{job_id}_thumb.{job.output_format}"
-        thumb_path = RENDER_OUTPUT_DIR / thumb_filename
+        thumb_path = get_render_output_dir() / thumb_filename
         thumbnail.save(str(thumb_path), format=pil_format, **save_kwargs)
 
         # Step 6: Update status to completed
