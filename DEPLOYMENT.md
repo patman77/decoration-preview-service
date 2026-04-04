@@ -343,3 +343,53 @@ aws s3 rb s3://decoration-preview-elements-YOUR_ACCOUNT_ID --force
 | CDK synth import errors | Ensure `aws-cdk-lib` is installed: `pip install -r requirements.txt` |
 | CloudFront 502 errors | ALB may not have healthy targets yet; wait for ECS tasks to start |
 | HTTPS Listener needs certificate | Don't set `CERTIFICATE_ARN` until you have an ACM cert; ALB works fine with HTTP only |
+| WAF scope error (`CLOUDFRONT` in non-us-east-1) | Ensure `api_stack.py` uses `scope="REGIONAL"` — see [WAF Notes](#waf-web-application-firewall-notes) |
+
+### Handling Stacks in ROLLBACK_COMPLETE State
+
+When a CloudFormation stack fails during creation it enters `ROLLBACK_COMPLETE`.
+A stack in this state **cannot be updated or redeployed** — it must be deleted
+first.
+
+#### Quick fix — use the cleanup command
+
+```bash
+# Interactively delete all failed stacks
+./deploy.sh cleanup
+
+# Then re-deploy
+./deploy.sh deploy
+```
+
+#### Manual fix via AWS CLI
+
+```bash
+# 1. Check which stacks are in a failed state
+aws cloudformation list-stacks \
+  --stack-status-filter ROLLBACK_COMPLETE CREATE_FAILED \
+  --query 'StackSummaries[*].[StackName,StackStatus]' \
+  --output table
+
+# 2. Delete the failed stack (start with the highest-level stack first)
+aws cloudformation delete-stack --stack-name decoration-preview-api
+
+# 3. Wait for deletion to complete
+aws cloudformation wait stack-delete-complete --stack-name decoration-preview-api
+
+# 4. Re-deploy
+./deploy.sh deploy
+```
+
+#### Deletion order for dependent stacks
+
+If multiple stacks are in `ROLLBACK_COMPLETE`, delete them in **reverse
+dependency order** (top-level first):
+
+1. `decoration-preview-monitoring`
+2. `decoration-preview-api`
+3. `decoration-preview-compute`
+4. `decoration-preview-storage`
+5. `decoration-preview-network`
+
+> **Tip:** The `./deploy.sh cleanup` command already processes stacks in this
+> order and prompts you before deleting each one.

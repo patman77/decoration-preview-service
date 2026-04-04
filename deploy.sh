@@ -11,6 +11,7 @@
 #   deploy     - Deploy all stacks to AWS
 #   deploy-stack <name> - Deploy a specific stack
 #   destroy    - Destroy all stacks (CAUTION!)
+#   cleanup    - Delete stacks stuck in ROLLBACK_COMPLETE state
 #   status     - Show deployment status and stack outputs
 #   diff       - Show pending changes before deploy
 # ============================================================
@@ -179,6 +180,60 @@ EOF
     log_ok "cdk.json updated."
 }
 
+# ── Cleanup failed stacks ───────────────────────────────────
+cmd_cleanup() {
+    log_info "Scanning for failed stacks in ROLLBACK_COMPLETE state..."
+    local stacks=(
+        "decoration-preview-monitoring"
+        "decoration-preview-api"
+        "decoration-preview-compute"
+        "decoration-preview-storage"
+        "decoration-preview-network"
+    )
+
+    local found_failed=false
+    for stack in "${stacks[@]}"; do
+        local status
+        status=$(aws cloudformation describe-stacks \
+            --stack-name "${stack}" \
+            --query 'Stacks[0].StackStatus' \
+            --output text \
+            --region "${AWS_REGION}" 2>/dev/null) || continue
+
+        if [[ "$status" == "ROLLBACK_COMPLETE" || "$status" == "CREATE_FAILED" || "$status" == "DELETE_FAILED" ]]; then
+            found_failed=true
+            log_warn "Stack ${stack} is in ${status} state."
+            read -rp "  Delete this stack? [y/N] " confirm
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_info "Deleting stack ${stack}..."
+                if aws cloudformation delete-stack --stack-name "${stack}" --region "${AWS_REGION}"; then
+                    log_info "Waiting for ${stack} deletion to complete..."
+                    aws cloudformation wait stack-delete-complete \
+                        --stack-name "${stack}" \
+                        --region "${AWS_REGION}" 2>/dev/null && \
+                        log_ok "Stack ${stack} deleted." || \
+                        log_error "Stack ${stack} deletion may have failed. Check the AWS Console."
+                else
+                    log_error "Failed to initiate deletion of ${stack}."
+                fi
+            else
+                log_info "Skipping ${stack}."
+            fi
+        elif [[ "$status" == "ROLLBACK_IN_PROGRESS" ]]; then
+            log_warn "Stack ${stack} is in ${status} — wait for rollback to finish, then re-run cleanup."
+        else
+            log_ok "Stack ${stack} is in ${status} — no cleanup needed."
+        fi
+    done
+
+    if ! $found_failed; then
+        log_ok "No stacks in a failed state. Nothing to clean up."
+    fi
+
+    echo ""
+    log_info "After cleanup, re-run: ./deploy.sh deploy"
+}
+
 # ── Commands ───────────────────────────────────────────────
 cmd_bootstrap() {
     check_prerequisites
@@ -327,6 +382,9 @@ case "${1:-help}" in
     destroy)
         cmd_destroy
         ;;
+    cleanup)
+        cmd_cleanup
+        ;;
     status)
         cmd_status
         ;;
@@ -342,6 +400,7 @@ case "${1:-help}" in
         echo "  deploy           Deploy all stacks"
         echo "  deploy-stack <n> Deploy a specific stack"
         echo "  destroy          Destroy all stacks (CAUTION!)"
+        echo "  cleanup          Delete failed stacks (ROLLBACK_COMPLETE)"
         echo "  status           Show deployment outputs"
         echo "  help             Show this help message"
         ;;
