@@ -22,6 +22,7 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,10 +32,46 @@ INFRA_DIR="${SCRIPT_DIR}/infrastructure"
 AWS_REGION="${AWS_REGION:-eu-central-1}"
 ENVIRONMENT="${ENVIRONMENT:-production}"
 
+# Timeout for potentially hanging commands (seconds)
+CHECK_TIMEOUT="${CHECK_TIMEOUT:-15}"
+
 log_info()  { echo -e "${BLUE}[INFO]${NC}  $*"; }
 log_ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
 log_warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
+log_debug() { echo -e "${CYAN}[DEBUG]${NC} $*"; }
+
+# Run a command with a timeout to prevent silent hangs
+run_with_timeout() {
+    local timeout_secs="$1"
+    shift
+    local description="$1"
+    shift
+
+    if command -v timeout &> /dev/null; then
+        if ! timeout "${timeout_secs}" "$@" 2>/tmp/deploy_timeout_err; then
+            local exit_code=$?
+            if [ $exit_code -eq 124 ]; then
+                log_error "${description} timed out after ${timeout_secs}s"
+                log_error "Command: $*"
+                log_error "This usually means the service is not responding. Check if it's running."
+            else
+                log_error "${description} failed (exit code: ${exit_code})"
+                log_error "stderr: $(cat /tmp/deploy_timeout_err 2>/dev/null)"
+            fi
+            return 1
+        fi
+    else
+        # Fallback: run without timeout but warn
+        log_warn "timeout command not available, running '${description}' without timeout guard..."
+        if ! "$@" 2>/tmp/deploy_timeout_err; then
+            log_error "${description} failed"
+            log_error "stderr: $(cat /tmp/deploy_timeout_err 2>/dev/null)"
+            return 1
+        fi
+    fi
+    return 0
+}
 
 # ── Pre-flight checks ──────────────────────────────────────
 check_prerequisites() {
@@ -63,17 +100,25 @@ check_prerequisites() {
     log_ok "CDK CLI found: $(cdk --version)"
 
     # Docker
+    log_debug "Checking for Docker binary..."
     if ! command -v docker &> /dev/null; then
         log_error "Docker not found. Install: https://docs.docker.com/get-docker/"
         exit 1
     fi
-    if ! docker info &> /dev/null; then
-        log_error "Docker daemon is not running. Please start Docker."
+    log_debug "Docker binary found at: $(command -v docker). Checking Docker daemon (timeout: ${CHECK_TIMEOUT}s)..."
+    if ! run_with_timeout "${CHECK_TIMEOUT}" "Docker daemon check" docker info > /dev/null; then
+        log_error "Docker daemon is not running or not responding within ${CHECK_TIMEOUT}s."
+        log_error "Troubleshooting:"
+        log_error "  - macOS: Open Docker Desktop and wait for it to fully start"
+        log_error "  - Linux: Run 'sudo systemctl start docker' or 'sudo service docker start'"
+        log_error "  - Permission issue? Try: 'sudo docker info' or add user to docker group"
+        log_error "  - Increase timeout: CHECK_TIMEOUT=30 ./deploy.sh bootstrap"
         exit 1
     fi
-    log_ok "Docker found and running"
+    log_ok "Docker found and running: $(docker --version)"
 
     # Python
+    log_debug "Checking for Python..."
     if ! command -v python3 &> /dev/null; then
         log_error "Python 3 not found."
         exit 1
@@ -81,6 +126,7 @@ check_prerequisites() {
     log_ok "Python found: $(python3 --version)"
 
     # Node.js (needed for CDK)
+    log_debug "Checking for Node.js..."
     if ! command -v node &> /dev/null; then
         log_error "Node.js not found. CDK requires Node.js. Install: https://nodejs.org/"
         exit 1
@@ -95,10 +141,22 @@ check_prerequisites() {
 install_deps() {
     log_info "Installing Python dependencies..."
     if [ ! -d "${SCRIPT_DIR}/venv" ]; then
+        log_debug "Creating virtual environment at ${SCRIPT_DIR}/venv ..."
         python3 -m venv "${SCRIPT_DIR}/venv"
+    else
+        log_debug "Virtual environment already exists."
     fi
     source "${SCRIPT_DIR}/venv/bin/activate"
-    pip install -q -r "${SCRIPT_DIR}/requirements.txt"
+    log_debug "Running pip install (this may take a minute on first run)..."
+    pip install -r "${SCRIPT_DIR}/requirements.txt" 2>&1 | while IFS= read -r line; do
+        # Show progress dots for quiet installs, full output for new installs
+        if [[ "$line" == *"already satisfied"* ]]; then
+            printf "."
+        else
+            echo "  $line"
+        fi
+    done
+    echo ""  # newline after dots
     log_ok "Dependencies installed."
 }
 
@@ -131,9 +189,26 @@ cmd_bootstrap() {
     local account_id
     account_id=$(aws sts get-caller-identity --query Account --output text)
     log_info "Bootstrapping CDK for account ${account_id} in ${AWS_REGION}..."
+    log_debug "Working directory: ${INFRA_DIR}"
+    log_debug "Running: cdk bootstrap aws://${account_id}/${AWS_REGION} --verbose"
     cd "${INFRA_DIR}"
-    cdk bootstrap "aws://${account_id}/${AWS_REGION}"
-    log_ok "CDK bootstrap complete."
+
+    # Run cdk bootstrap with --verbose so you can see exactly what's happening.
+    # CDK bootstrap creates an S3 bucket + ECR repo + IAM roles in your account;
+    # it can take 2-5 minutes on first run.
+    if cdk bootstrap "aws://${account_id}/${AWS_REGION}" --verbose 2>&1 | tee /tmp/cdk_bootstrap.log; then
+        log_ok "CDK bootstrap complete."
+    else
+        local exit_code=$?
+        log_error "CDK bootstrap failed (exit code: ${exit_code})"
+        log_error "Full log saved to: /tmp/cdk_bootstrap.log"
+        log_error "Common fixes:"
+        log_error "  - Check IAM permissions (AdministratorAccess or CDK-specific policy needed)"
+        log_error "  - Verify region is correct: AWS_REGION=${AWS_REGION}"
+        log_error "  - Check Docker is running (CDK bootstrap may build container assets)"
+        log_error "  - Try: cdk bootstrap aws://${account_id}/${AWS_REGION} --verbose"
+        exit ${exit_code}
+    fi
 }
 
 cmd_synth() {
