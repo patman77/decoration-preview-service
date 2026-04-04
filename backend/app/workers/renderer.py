@@ -293,3 +293,76 @@ async def process_render_job(
             )
         except Exception:
             logger.error("Failed to update job status for %s", job_id)
+
+
+async def _poll_sqs_queue() -> None:
+    """Long-running SQS queue poller for render worker mode.
+
+    In production, this continuously polls the SQS render queue for
+    new jobs. For the current stubbed version, it runs an idle loop
+    to keep the container alive and ready to process jobs.
+
+    The actual SQS integration would:
+    1. Receive messages from the render queue
+    2. Parse the job payload
+    3. Download artwork from S3
+    4. Call process_render_job()
+    5. Delete the message on success
+    6. Let it return to queue on failure (dead-letter queue handles retries)
+    """
+    import signal
+    import sys
+
+    shutdown = False
+
+    def handle_signal(signum, frame):
+        nonlocal shutdown
+        logger.info("Received signal %s, shutting down gracefully...", signum)
+        shutdown = True
+
+    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, handle_signal)
+
+    logger.info("Render worker started, polling for jobs...")
+
+    while not shutdown:
+        try:
+            # In production: poll SQS queue
+            # messages = sqs_client.receive_message(
+            #     QueueUrl=os.environ.get("RENDER_QUEUE_URL"),
+            #     MaxNumberOfMessages=1,
+            #     WaitTimeSeconds=20,  # Long polling
+            # )
+            # For now, just wait (long-poll simulation)
+            await asyncio.sleep(20)
+            logger.debug("Render worker heartbeat - waiting for jobs...")
+        except asyncio.CancelledError:
+            logger.info("Worker task cancelled, shutting down...")
+            break
+        except Exception as e:
+            logger.error("Error in worker poll loop: %s", e, exc_info=True)
+            await asyncio.sleep(5)  # Back off on errors
+
+    logger.info("Render worker stopped.")
+
+
+def main() -> None:
+    """Entry point for the render worker process."""
+    import sys
+
+    from backend.app.core.logging import setup_logging
+
+    setup_logging()
+    setup_logger = get_logger("worker.main")
+    setup_logger.info("Initializing render worker process...")
+    try:
+        asyncio.run(_poll_sqs_queue())
+    except KeyboardInterrupt:
+        setup_logger.info("Worker interrupted, exiting.")
+    except Exception as e:
+        setup_logger.error("Worker crashed: %s", e, exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
