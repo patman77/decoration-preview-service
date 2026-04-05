@@ -2,11 +2,7 @@
 
 ## Goal
 
-Deploy a **production-grade async decoration preview service** to AWS using ECS Fargate.
-
-- Accept artwork + 3D element → render a decorated preview image
-- Async processing via SQS with job status tracking in DynamoDB
-- Fully automated infrastructure via AWS CDK
+Async decoration preview service on AWS — accept artwork + 3D element, render composite image, return via S3.
 
 ## MVP Scope
 
@@ -21,12 +17,13 @@ Deploy a **production-grade async decoration preview service** to AWS using ECS 
 - **Storage**: S3 (artwork, elements, renders), DynamoDB (jobs), SQS (queue + DLQ)
 - **Infrastructure**: 5 CDK stacks — network, storage, api, compute, monitoring
 - **Region**: eu-central-1
+- **Deploy**: `./deploy.sh bootstrap` from repo root
 
-## Non-Goals
+## Non-Goals (MVP)
 
-- No custom domain / HTTPS (no certificate ARN provided)
+- No HTTPS / custom domain (no certificate ARN)
 - No CI/CD pipeline (manual deploy via `deploy.sh`)
 - No user authentication / multi-tenancy
-- No GPU-based rendering
-- No auto-scaling (fixed Fargate task count for MVP)
-- No production monitoring dashboards (basic CloudWatch only)
+- No GPU rendering
+- No auto-scaling (fixed Fargate task count)
+- No production monitoring dashboards
