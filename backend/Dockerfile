@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+# Force AMD64 architecture for ECS Fargate compatibility
+# (builds correctly even on Apple Silicon/ARM64 Macs)
+FROM --platform=linux/amd64 python:3.11-slim
 
 WORKDIR /app
 
