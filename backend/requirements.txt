@@ -1,5 +1,22 @@
-# Minimal dependencies for basic FastAPI deployment
-# Add more dependencies incrementally once basic version works
-
+# FastAPI and server
 fastapi>=0.109.0
 uvicorn[standard]>=0.27.0
+
+# Pydantic for data validation
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# File upload handling
+python-multipart>=0.0.6
+
+# AWS SDK (for S3, DynamoDB, SQS in production)
+boto3>=1.34.0
+
+# Image processing
+Pillow>=10.2.0
+
+# HTTP client (for callbacks)
+httpx>=0.26.0
+
+# Additional utilities
+aiofiles>=23.2.1

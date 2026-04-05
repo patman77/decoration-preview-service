@@ -1,7 +1,6 @@
-"""Minimal FastAPI application - Basic version for deployment testing.
+"""FastAPI application for Decoration Preview Service.
 
-This stripped-down version ensures the container starts successfully.
-Once confirmed working, we can incrementally add features.
+This is the full-featured version with all API endpoints restored.
 """
 
 import logging
@@ -14,8 +13,21 @@ from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from backend.app.api.routes import router as api_router
+from backend.app.core.config import get_settings
+from backend.app.core.exceptions import (
+    ElementNotFoundError,
+    FileValidationError,
+    RenderJobNotFoundError,
+    element_not_found_handler,
+    file_validation_handler,
+    generic_exception_handler,
+    render_job_not_found_handler,
+)
+from backend.app.core.logging import setup_logging
+
 # ---------------------------------------------------------------------------
-# Logging – immediate stdout so CloudWatch picks it up
+# Logging
 # ---------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
@@ -24,16 +36,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Initialize structured logging
+setup_logging()
+
 # Startup time tracking
 START_TIME = time.time()
 
 # ---------------------------------------------------------------------------
 # Create FastAPI application
 # ---------------------------------------------------------------------------
+settings = get_settings()
+
 app = FastAPI(
     title="Decoration Preview Service",
     description="Cloud-native API for rendering 2D artwork onto 3D elements",
-    version="1.0.0",
+    version=settings.app_version,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -41,21 +58,35 @@ app = FastAPI(
 
 # Log startup
 logger.info("=" * 60)
-logger.info("Decoration Preview Service starting (minimal version)...")
+logger.info("Decoration Preview Service starting (full version)...")
 logger.info("Python %s", sys.version)
 logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
+logger.info("Environment: %s", settings.environment)
 logger.info("=" * 60)
+
+# ---------------------------------------------------------------------------
+# Exception handlers
+# ---------------------------------------------------------------------------
+app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
+app.add_exception_handler(FileValidationError, file_validation_handler)
+app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
 
 # ---------------------------------------------------------------------------
 # CORS Middleware
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.allowed_origins + ["*"],  # Allow all during development
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ---------------------------------------------------------------------------
+# Include API router
+# ---------------------------------------------------------------------------
+app.include_router(api_router)
 
 
 # ---------------------------------------------------------------------------
@@ -70,7 +101,8 @@ async def health_check():
         content={
             "status": "healthy",
             "service": "decoration-preview-api",
-            "version": "1.0.0",
+            "version": settings.app_version,
+            "environment": settings.environment,
             "uptime_seconds": uptime,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
@@ -84,11 +116,15 @@ async def root():
         status_code=status.HTTP_200_OK,
         content={
             "service": "decoration-preview-api",
-            "version": "1.0.0",
+            "version": settings.app_version,
             "description": "Cloud-native API for rendering 2D artwork onto 3D elements",
             "documentation": "/docs",
             "health_check": "/health",
-            "status": "minimal deployment - testing basic functionality",
+            "api_base_url": settings.api_prefix,
+            "endpoints": {
+                "render": f"{settings.api_prefix}/render",
+                "elements": f"{settings.api_prefix}/elements",
+            },
         },
     )
 
