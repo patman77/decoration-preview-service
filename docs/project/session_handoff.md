@@ -1,31 +1,34 @@
 # Session Handoff
 
+_Updated: 2026-04-05_
+
 ## Summary
 
-Set up full AWS deployment pipeline for decoration-preview-service using CDK.
+Built full AWS deployment pipeline for decoration-preview-service using CDK.
 Fixed 8+ deployment blockers. Got both ECS services running on Fargate.
-Restored full FastAPI API via PR #9 (merged into `deployment/aws-setup`).
+Restored full FastAPI API. Consolidated all work to `main`.
 
 ## Branch State
 
-- `main` — includes merged PRs #6–#10
-- `deployment/aws-setup` — all deployment fixes + PR #9 merge (commit `d50b216`)
-  - More recent than main because PR #9 merged feature/restore-fastapi INTO this branch
-- `feature/restore-fastapi` — merged into deployment/aws-setup, can be deleted
+- **`main`** — single active branch, all work merged
+- Old branches (`deployment/aws-setup`, `feature/restore-fastapi`) deleted
+- All PRs (#6–#10) merged into main
 
-## Key Files Touched
+## Key Files
 
-- `backend/Dockerfile` — platform fix, health check tuning
-- `backend/app/main.py` — full API restore
-- `backend/app/workers/renderer.py` — lazy init, SQS polling loop
-- `backend/requirements.txt` — full dependency restore
-- `infrastructure/stacks/compute_stack.py` — health check timeouts, grace period
-- `infrastructure/stacks/api_stack.py` — WAF scope fix, conditional HTTPS
-- `deploy.sh` — cancel-stuck, cleanup commands
-- `DEPLOYMENT.md` — troubleshooting docs
+| File | What Changed |
+|------|--------------|
+| `backend/Dockerfile` | `--platform=linux/amd64`, health check 120s |
+| `backend/app/main.py` | Full API with routers, error handlers, CORS |
+| `backend/app/workers/renderer.py` | Lazy init, SQS polling, graceful shutdown |
+| `backend/requirements.txt` | Full deps (FastAPI, boto3, Pillow, etc.) |
+| `infrastructure/stacks/compute_stack.py` | Health check timeouts, grace period |
+| `infrastructure/stacks/api_stack.py` | WAF REGIONAL, conditional HTTPS |
+| `deploy.sh` | cancel-stuck, cleanup, bootstrap commands |
 
-## Next Step
+## Resume Steps
 
-1. Run `./deploy.sh bootstrap` to deploy with full API
-2. Test endpoints: `GET /health`, `POST /api/v1/render`, `GET /api/v1/elements`
-3. Verify render worker processes SQS messages
+1. `./deploy.sh bootstrap` — deploy all stacks
+2. Test: `curl http://<alb-dns>/health`
+3. Test: `POST /api/v1/render` and `GET /api/v1/elements`
+4. Check CloudWatch for render worker activity

@@ -2,16 +2,16 @@
 
 | # | Decision | Reasoning |
 |---|----------|-----------|
-| 1 | HTTP only (no HTTPS) | No certificate ARN provided; simplifies MVP deployment |
-| 2 | WAF REGIONAL scope | WAF with CLOUDFRONT scope must be in us-east-1; our stack is eu-central-1 |
-| 3 | ECS circuit breaker + auto-rollback | Prevents stuck deployments; auto-recovers from bad deploys |
-| 4 | ECS Exec enabled | Allows `aws ecs execute-command` for live container debugging |
-| 5 | `--platform=linux/amd64` in Dockerfile | Fixes ARM64/AMD64 mismatch when building on Apple Silicon for Fargate x86_64 |
-| 6 | `/tmp/rendered` for temp storage | Fargate containers have read-only root FS; `/tmp` is writable |
-| 7 | 120s health check start period | ECS tasks need time for container startup + pip install; prevents premature kill |
-| 8 | 180s service stabilization grace period | Gives ECS time to register healthy targets before circuit breaker triggers |
-| 9 | Lazy imports in renderer.py | Avoids import-time crashes when boto3/Pillow not yet available at module load |
-| 10 | Minimal stdlib HTTP server for debugging | Used temporarily to isolate Fargate startup issues from FastAPI complexity |
-| 11 | SQS long-polling loop in render worker | Worker must have a long-running process; short-lived tasks get killed by Fargate |
-| 12 | Non-root Docker user (`appuser`) | Security best practice for container workloads |
-| 13 | 5 separate CDK stacks | Allows independent deployment and rollback of each layer |
+| 1 | HTTP only (no HTTPS) | No certificate ARN; simplifies MVP |
+| 2 | WAF REGIONAL scope | CLOUDFRONT scope requires us-east-1; stacks are in eu-central-1 |
+| 3 | ECS circuit breaker + auto-rollback | Prevents stuck deployments |
+| 4 | ECS Exec enabled | Live debugging via `aws ecs execute-command` |
+| 5 | `--platform=linux/amd64` in Dockerfile | Fixes ARM64→AMD64 mismatch building on Apple Silicon |
+| 6 | `/tmp/rendered` for temp files | Fargate has read-only root FS; `/tmp` is writable |
+| 7 | 120s health check start period | Cold start needs time; prevents premature ECS kill |
+| 8 | 180s service stabilization grace | ECS needs time to register targets before circuit breaker |
+| 9 | Lazy imports in renderer.py | Avoids import-time crashes before deps available |
+| 10 | SQS long-polling in render worker | Worker needs long-running process; short tasks get killed |
+| 11 | Non-root Docker user (`appuser`) | Container security best practice |
+| 12 | 5 separate CDK stacks | Independent deployment/rollback per layer |
+| 13 | Single `main` branch | Consolidated from multiple feature branches for simplicity |
