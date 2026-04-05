@@ -1,23 +1,5 @@
-# Decoration Preview Service - Python Dependencies
-# ================================================
+# Minimal dependencies for basic FastAPI deployment
+# Add more dependencies incrementally once basic version works
 
-# Web Framework
-fastapi>=0.109.0,<1.0.0
-uvicorn[standard]>=0.27.0,<1.0.0
-
-# Request/Response handling
-python-multipart>=0.0.6,<1.0.0
-pydantic>=2.5.0,<3.0.0
-pydantic-settings>=2.1.0,<3.0.0
-
-# AWS SDK
-boto3>=1.34.0,<2.0.0
-
-# Image Processing
-Pillow>=10.2.0,<11.0.0
-
-# HTTP client (for callbacks)
-httpx>=0.26.0,<1.0.0
-
-# Utilities
-python-dotenv>=1.0.0,<2.0.0
+fastapi>=0.109.0
+uvicorn[standard]>=0.27.0

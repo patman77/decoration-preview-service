@@ -1,36 +1,18 @@
-"""FastAPI application entry point.
+"""Minimal FastAPI application - Basic version for deployment testing.
 
-This module initializes the FastAPI application with:
-- CORS middleware for cross-origin requests
-- Custom exception handlers
-- API routes
-- Health check endpoint
-- Startup/shutdown lifecycle events
+This stripped-down version ensures the container starts successfully.
+Once confirmed working, we can incrementally add features.
 """
 
 import logging
 import os
 import sys
 import time
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-
-from backend.app.api.routes import router as api_router
-from backend.app.core.config import get_settings
-from backend.app.core.exceptions import (
-    ElementNotFoundError,
-    FileValidationError,
-    RenderJobNotFoundError,
-    element_not_found_handler,
-    file_validation_handler,
-    generic_exception_handler,
-    render_job_not_found_handler,
-)
-from backend.app.core.logging import get_logger
 
 # ---------------------------------------------------------------------------
 # Logging – immediate stdout so CloudWatch picks it up
@@ -40,57 +22,36 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     stream=sys.stdout,
 )
-logger = get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 # Startup time tracking
 START_TIME = time.time()
 
-
-# ---------------------------------------------------------------------------
-# Lifespan context manager for startup/shutdown events
-# ---------------------------------------------------------------------------
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Handle application startup and shutdown events."""
-    # Startup
-    settings = get_settings()
-    logger.info("=" * 60)
-    logger.info("Decoration Preview Service starting...")
-    logger.info("Python %s", sys.version)
-    logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
-    logger.info("Environment: %s", settings.environment)
-    logger.info("Debug: %s", settings.debug)
-    logger.info("Log level: %s", settings.log_level)
-    logger.info("=" * 60)
-
-    yield
-
-    # Shutdown
-    logger.info("Decoration Preview Service shutting down...")
-
-
 # ---------------------------------------------------------------------------
 # Create FastAPI application
 # ---------------------------------------------------------------------------
-settings = get_settings()
-
 app = FastAPI(
-    title=settings.app_name,
-    description="Cloud-native API for rendering 2D artwork onto 3D elements with async processing",
-    version=settings.app_version,
+    title="Decoration Preview Service",
+    description="Cloud-native API for rendering 2D artwork onto 3D elements",
+    version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
-    lifespan=lifespan,
 )
 
+# Log startup
+logger.info("=" * 60)
+logger.info("Decoration Preview Service starting (minimal version)...")
+logger.info("Python %s", sys.version)
+logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
+logger.info("=" * 60)
 
 # ---------------------------------------------------------------------------
 # CORS Middleware
 # ---------------------------------------------------------------------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins + ["*"],  # Add * for development flexibility
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -98,22 +59,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# Exception Handlers
-# ---------------------------------------------------------------------------
-app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
-app.add_exception_handler(FileValidationError, file_validation_handler)
-app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
-app.add_exception_handler(Exception, generic_exception_handler)
-
-
-# ---------------------------------------------------------------------------
-# Include API routers
-# ---------------------------------------------------------------------------
-app.include_router(api_router)
-
-
-# ---------------------------------------------------------------------------
-# Health check endpoint (not part of API router - always accessible)
+# Health check endpoint
 # ---------------------------------------------------------------------------
 @app.get("/health", tags=["Health"])
 async def health_check():
@@ -124,8 +70,7 @@ async def health_check():
         content={
             "status": "healthy",
             "service": "decoration-preview-api",
-            "version": settings.app_version,
-            "environment": settings.environment,
+            "version": "1.0.0",
             "uptime_seconds": uptime,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         },
@@ -139,11 +84,11 @@ async def root():
         status_code=status.HTTP_200_OK,
         content={
             "service": "decoration-preview-api",
-            "version": settings.app_version,
+            "version": "1.0.0",
             "description": "Cloud-native API for rendering 2D artwork onto 3D elements",
             "documentation": "/docs",
             "health_check": "/health",
-            "api_prefix": settings.api_prefix,
+            "status": "minimal deployment - testing basic functionality",
         },
     )
 
