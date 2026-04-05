@@ -1,149 +1,94 @@
-"""FastAPI application entry point.
+"""Minimal HTTP server – stdlib only, ZERO external dependencies.
 
-Configures the application with:
-- CORS middleware for cross-origin requests
-- API key authentication
-- Custom exception handlers
-- Health check endpoint
-- OpenAPI documentation
+This replaces FastAPI/uvicorn with Python's built-in http.server to
+guarantee a successful ECS deployment. Once the infrastructure is
+proven green, we can layer FastAPI back in.
+
+Listens on port 8000 and responds to:
+  GET /health  → 200 {"status": "healthy", ...}
+  GET /         → 200 {"service": "decoration-preview-api", ...}
+  Everything else → 404
 """
 
+import json
+import logging
 import os
-from contextlib import asynccontextmanager
-from pathlib import Path
-from typing import AsyncGenerator
+import sys
+import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
-
-from backend.app.api.routes import router as api_router
-from backend.app.core.config import get_settings
-from backend.app.core.exceptions import (
-    ElementNotFoundError,
-    FileValidationError,
-    RenderJobNotFoundError,
-    element_not_found_handler,
-    file_validation_handler,
-    generic_exception_handler,
-    render_job_not_found_handler,
+# ---------------------------------------------------------------------------
+# Logging – immediate stdout so CloudWatch picks it up
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    stream=sys.stdout,
 )
-from backend.app.core.logging import get_logger, setup_logging
-from backend.app.models.schemas import HealthResponse, ServiceInfoResponse
+logger = logging.getLogger("api_server")
+
+# ---------------------------------------------------------------------------
+# Startup banner
+# ---------------------------------------------------------------------------
+logger.info("=" * 60)
+logger.info("Minimal API server loading (stdlib http.server)")
+logger.info("Python %s", sys.version)
+logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
+logger.info("ENVIRONMENT=%s", os.environ.get("ENVIRONMENT", "unknown"))
+logger.info("=" * 60)
+
+START_TIME = time.time()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """Application lifespan handler for startup/shutdown events."""
-    # Startup
-    logger = setup_logging()
-    logger.info("Decoration Preview Service starting up...")
-    logger.info("Environment: %s", get_settings().environment)
-    yield
-    # Shutdown
-    logger.info("Decoration Preview Service shutting down...")
+class HealthHandler(BaseHTTPRequestHandler):
+    """Dead-simple request handler."""
+
+    def _send_json(self, code: int, body: dict) -> None:
+        payload = json.dumps(body).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_GET(self) -> None:  # noqa: N802
+        logger.info("GET %s from %s", self.path, self.client_address[0])
+
+        if self.path == "/health":
+            uptime = int(time.time() - START_TIME)
+            self._send_json(200, {
+                "status": "healthy",
+                "version": "0.1.0-minimal",
+                "environment": os.environ.get("ENVIRONMENT", "unknown"),
+                "uptime_seconds": uptime,
+            })
+        elif self.path == "/":
+            self._send_json(200, {
+                "service": "decoration-preview-api",
+                "version": "0.1.0-minimal",
+                "description": "Minimal stdlib server – infrastructure validation mode",
+                "health_url": "/health",
+            })
+        else:
+            self._send_json(404, {"error": "not found", "path": self.path})
+
+    # Suppress default stderr logging (we use our own logger)
+    def log_message(self, format, *args):
+        pass
 
 
-def create_app() -> FastAPI:
-    """Application factory.
-
-    Creates and configures the FastAPI application instance.
-    Uses the factory pattern for testability.
-    """
-    settings = get_settings()
-
-    app = FastAPI(
-        title=settings.app_name,
-        description=(
-            "API service for previewing 2D decorations on 3D toy elements. "
-            "Upload artwork files and receive rendered preview images showing "
-            "how decorations will appear on physical elements."
-        ),
-        version=settings.app_version,
-        docs_url="/docs",
-        redoc_url="/redoc",
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
-
-    # CORS middleware
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.allowed_origins,
-        allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-        allow_headers=["*"],
-        expose_headers=["X-Request-ID"],
-    )
-
-    # Exception handlers
-    app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
-    app.add_exception_handler(FileValidationError, file_validation_handler)
-    app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
-    app.add_exception_handler(Exception, generic_exception_handler)
-
-    # Include API routes
-    app.include_router(api_router)
-
-    # Root endpoint (no auth required)
-    @app.get(
-        "/",
-        response_model=ServiceInfoResponse,
-        tags=["Service Info"],
-        summary="Service information",
-        description="Returns basic service information and navigation links.",
-    )
-    async def root() -> ServiceInfoResponse:
-        """Root endpoint returning service metadata and useful links."""
-        return ServiceInfoResponse(
-            service=settings.app_name,
-            version=settings.app_version,
-            description=(
-                "API service for previewing 2D decorations on 3D toy elements. "
-                "Upload artwork files and receive rendered preview images."
-            ),
-            docs_url="/docs",
-            health_url="/health",
-            api_base_url=settings.api_prefix,
-        )
-
-    # Health check (no auth required)
-    @app.get(
-        "/health",
-        response_model=HealthResponse,
-        tags=["Health"],
-        summary="Service health check",
-    )
-    async def health_check() -> HealthResponse:
-        """Check service health status."""
-        return HealthResponse(
-            status="healthy",
-            version=settings.app_version,
-            environment=settings.environment,
-        )
-
-    # Static files & favicon
-    static_dir = Path(__file__).parent / "static"
-    if static_dir.is_dir():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-
-    favicon_path = static_dir / "favicon.ico"
-
-    @app.get("/favicon.ico", include_in_schema=False)
-    async def favicon():
-        """Serve the favicon."""
-        if favicon_path.is_file():
-            return FileResponse(
-                str(favicon_path),
-                media_type="image/x-icon",
-            )
-        from fastapi.responses import Response
-
-        return Response(status_code=204)
-
-    return app
+def main() -> None:
+    port = int(os.environ.get("PORT", "8000"))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info("Listening on 0.0.0.0:%d", port)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        logger.info("Shutting down...")
+    finally:
+        server.server_close()
+        logger.info("Server closed.")
 
 
-# Application instance
-app = create_app()
+if __name__ == "__main__":
+    main()

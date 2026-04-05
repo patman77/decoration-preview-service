@@ -11,7 +11,10 @@
 #   deploy     - Deploy all stacks to AWS
 #   deploy-stack <name> - Deploy a specific stack
 #   destroy    - Destroy all stacks (CAUTION!)
+#   cleanup    - Delete stacks stuck in ROLLBACK_COMPLETE state + detect stuck stacks
+#   cancel-stuck - Cancel stacks stuck in CREATE_IN_PROGRESS / UPDATE_IN_PROGRESS
 #   status     - Show deployment status and stack outputs
+#   ecs-status - Show ECS service and task status (useful during deploys)
 #   diff       - Show pending changes before deploy
 # ============================================================
 
@@ -179,6 +182,198 @@ EOF
     log_ok "cdk.json updated."
 }
 
+# ── Cleanup failed stacks ───────────────────────────────────
+cmd_cleanup() {
+    log_info "Scanning for failed or stuck stacks..."
+    local stacks=(
+        "decoration-preview-monitoring"
+        "decoration-preview-api"
+        "decoration-preview-compute"
+        "decoration-preview-storage"
+        "decoration-preview-network"
+    )
+
+    local found_issues=false
+    for stack in "${stacks[@]}"; do
+        local status
+        status=$(aws cloudformation describe-stacks \
+            --stack-name "${stack}" \
+            --query 'Stacks[0].StackStatus' \
+            --output text \
+            --region "${AWS_REGION}" 2>/dev/null) || continue
+
+        if [[ "$status" == "ROLLBACK_COMPLETE" || "$status" == "CREATE_FAILED" || "$status" == "DELETE_FAILED" ]]; then
+            found_issues=true
+            log_warn "Stack ${stack} is in ${status} state."
+            read -rp "  Delete this stack? [y/N] " confirm
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_info "Deleting stack ${stack}..."
+                if aws cloudformation delete-stack --stack-name "${stack}" --region "${AWS_REGION}"; then
+                    log_info "Waiting for ${stack} deletion to complete..."
+                    aws cloudformation wait stack-delete-complete \
+                        --stack-name "${stack}" \
+                        --region "${AWS_REGION}" 2>/dev/null && \
+                        log_ok "Stack ${stack} deleted." || \
+                        log_error "Stack ${stack} deletion may have failed. Check the AWS Console."
+                else
+                    log_error "Failed to initiate deletion of ${stack}."
+                fi
+            else
+                log_info "Skipping ${stack}."
+            fi
+        elif [[ "$status" == "CREATE_IN_PROGRESS" || "$status" == "UPDATE_IN_PROGRESS" ]]; then
+            found_issues=true
+            log_warn "Stack ${stack} is STUCK in ${status} state!"
+            log_warn "This stack cannot be updated or redeployed while in this state."
+            log_info "To cancel this stuck operation, run:"
+            echo ""
+            echo "    ./deploy.sh cancel-stuck"
+            echo ""
+        elif [[ "$status" == "ROLLBACK_IN_PROGRESS" || "$status" == "DELETE_IN_PROGRESS" || "$status" == "UPDATE_ROLLBACK_IN_PROGRESS" ]]; then
+            found_issues=true
+            log_warn "Stack ${stack} is in ${status} — wait for it to finish, then re-run cleanup."
+        else
+            log_ok "Stack ${stack} is in ${status} — no cleanup needed."
+        fi
+    done
+
+    if ! $found_issues; then
+        log_ok "No stacks in a failed or stuck state. Nothing to clean up."
+    fi
+
+    echo ""
+    log_info "After cleanup, re-run: ./deploy.sh deploy"
+}
+
+# ── Cancel stuck stacks (CREATE_IN_PROGRESS / UPDATE_IN_PROGRESS) ──
+cmd_cancel_stuck() {
+    log_info "Scanning for stacks stuck in CREATE_IN_PROGRESS or UPDATE_IN_PROGRESS..."
+    local stacks=(
+        "decoration-preview-monitoring"
+        "decoration-preview-api"
+        "decoration-preview-compute"
+        "decoration-preview-storage"
+        "decoration-preview-network"
+    )
+
+    local found_stuck=false
+    for stack in "${stacks[@]}"; do
+        local status
+        status=$(aws cloudformation describe-stacks \
+            --stack-name "${stack}" \
+            --query 'Stacks[0].StackStatus' \
+            --output text \
+            --region "${AWS_REGION}" 2>/dev/null) || continue
+
+        if [[ "$status" == "CREATE_IN_PROGRESS" ]]; then
+            found_stuck=true
+            echo ""
+            log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_warn "Stack ${stack} is stuck in CREATE_IN_PROGRESS"
+            log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            log_info "Stack events (last 5):"
+            aws cloudformation describe-stack-events \
+                --stack-name "${stack}" \
+                --query 'StackEvents[0:5].[Timestamp,ResourceStatus,ResourceType,LogicalResourceId,ResourceStatusReason]' \
+                --output table \
+                --region "${AWS_REGION}" 2>/dev/null || true
+            echo ""
+            log_warn "⚠️  Canceling a CREATE_IN_PROGRESS stack will:"
+            log_warn "   • Trigger a ROLLBACK of all resources created so far"
+            log_warn "   • The stack will move to ROLLBACK_IN_PROGRESS → ROLLBACK_COMPLETE"
+            log_warn "   • After rollback, you must DELETE the stack before redeploying"
+            log_warn "   • Run './deploy.sh cleanup' after the rollback completes"
+            echo ""
+            read -rp "  Cancel stack creation for ${stack}? [y/N] " confirm
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_info "Canceling stack creation for ${stack}..."
+                if aws cloudformation cancel-update-in-progress \
+                    --stack-name "${stack}" \
+                    --region "${AWS_REGION}" 2>/dev/null; then
+                    log_ok "Cancel signal sent for ${stack}."
+                    log_info "The stack will roll back. This may take several minutes."
+                    log_info "Monitor progress with:"
+                    echo "    aws cloudformation describe-stacks --stack-name ${stack} --query 'Stacks[0].StackStatus' --output text --region ${AWS_REGION}"
+                else
+                    # cancel-update-in-progress only works for UPDATE_IN_PROGRESS.
+                    # For CREATE_IN_PROGRESS, we need to delete the stack directly.
+                    log_warn "cancel-update-in-progress not applicable (stack is in CREATE, not UPDATE)."
+                    log_info "For stacks in CREATE_IN_PROGRESS, the only option is to DELETE the stack."
+                    log_warn "⚠️  This will delete the stack and all resources created so far!"
+                    read -rp "  Delete stack ${stack}? [y/N] " confirm_delete
+                    if [[ "$confirm_delete" =~ ^[yY]$ ]]; then
+                        log_info "Deleting stack ${stack} (this cancels the in-progress creation)..."
+                        if aws cloudformation delete-stack --stack-name "${stack}" --region "${AWS_REGION}"; then
+                            log_ok "Delete initiated for ${stack}."
+                            log_info "Waiting for deletion to complete (this may take several minutes)..."
+                            if aws cloudformation wait stack-delete-complete \
+                                --stack-name "${stack}" \
+                                --region "${AWS_REGION}" 2>/dev/null; then
+                                log_ok "Stack ${stack} deleted successfully."
+                            else
+                                log_warn "Stack ${stack} may still be deleting. Check status with:"
+                                echo "    aws cloudformation describe-stacks --stack-name ${stack} --query 'Stacks[0].StackStatus' --output text --region ${AWS_REGION}"
+                                log_info "If stuck in DELETE_FAILED, run './deploy.sh cleanup' to retry."
+                            fi
+                        else
+                            log_error "Failed to initiate deletion of ${stack}."
+                        fi
+                    else
+                        log_info "Skipping ${stack}."
+                    fi
+                fi
+            else
+                log_info "Skipping ${stack}."
+            fi
+        elif [[ "$status" == "UPDATE_IN_PROGRESS" ]]; then
+            found_stuck=true
+            echo ""
+            log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            log_warn "Stack ${stack} is stuck in UPDATE_IN_PROGRESS"
+            log_warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+            echo ""
+            log_info "Stack events (last 5):"
+            aws cloudformation describe-stack-events \
+                --stack-name "${stack}" \
+                --query 'StackEvents[0:5].[Timestamp,ResourceStatus,ResourceType,LogicalResourceId,ResourceStatusReason]' \
+                --output table \
+                --region "${AWS_REGION}" 2>/dev/null || true
+            echo ""
+            log_warn "⚠️  Canceling an UPDATE_IN_PROGRESS stack will:"
+            log_warn "   • Trigger a ROLLBACK to the previous stack state"
+            log_warn "   • The stack will move to UPDATE_ROLLBACK_IN_PROGRESS → UPDATE_ROLLBACK_COMPLETE"
+            log_warn "   • After rollback, you can redeploy normally"
+            echo ""
+            read -rp "  Cancel stack update for ${stack}? [y/N] " confirm
+            if [[ "$confirm" =~ ^[yY]$ ]]; then
+                log_info "Canceling stack update for ${stack}..."
+                if aws cloudformation cancel-update-in-progress \
+                    --stack-name "${stack}" \
+                    --region "${AWS_REGION}"; then
+                    log_ok "Cancel signal sent for ${stack}."
+                    log_info "The stack will roll back to its previous state. This may take several minutes."
+                    log_info "Monitor progress with:"
+                    echo "    aws cloudformation describe-stacks --stack-name ${stack} --query 'Stacks[0].StackStatus' --output text --region ${AWS_REGION}"
+                else
+                    log_error "Failed to cancel update for ${stack}. Check the AWS Console."
+                fi
+            else
+                log_info "Skipping ${stack}."
+            fi
+        fi
+    done
+
+    if ! $found_stuck; then
+        log_ok "No stacks stuck in CREATE_IN_PROGRESS or UPDATE_IN_PROGRESS."
+    else
+        echo ""
+        log_info "After the stack finishes rolling back or is deleted:"
+        log_info "  1. Run './deploy.sh cleanup' to delete any ROLLBACK_COMPLETE stacks"
+        log_info "  2. Run './deploy.sh deploy' to redeploy"
+    fi
+}
+
 # ── Commands ───────────────────────────────────────────────
 cmd_bootstrap() {
     check_prerequisites
@@ -241,6 +436,11 @@ cmd_deploy() {
     log_info "Deploying all stacks to AWS (${AWS_REGION})..."
     echo ""
     log_warn "This will create/update AWS resources and may incur charges."
+    log_info "ECS service creation can take 5-10 minutes. If it seems stuck:"
+    log_info "  - Open another terminal and run: ./deploy.sh ecs-status"
+    log_info "  - Check CloudWatch logs: /ecs/decoration-preview/api"
+    log_info "  - Deployment circuit breaker will auto-rollback on repeated failures."
+    echo ""
     read -rp "Continue? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[yY]$ ]]; then
         log_info "Deployment cancelled."
@@ -297,6 +497,88 @@ cmd_status() {
     done
 }
 
+# ── ECS Status ──────────────────────────────────────────────
+cmd_ecs_status() {
+    local cluster="decoration-preview-cluster"
+    local region="${AWS_REGION}"
+
+    echo ""
+    log_info "ECS Cluster: ${cluster} (${region})"
+    echo ""
+
+    # Show ECS services
+    echo -e "${BLUE}── ECS Services ──${NC}"
+    for service in decoration-preview-api decoration-preview-render; do
+        echo -e "\n${CYAN}Service: ${service}${NC}"
+        aws ecs describe-services \
+            --cluster "${cluster}" \
+            --services "${service}" \
+            --query 'services[0].{Status:status,Running:runningCount,Desired:desiredCount,Pending:pendingCount,Deployments:deployments[*].{Status:status,Running:runningCount,Desired:desiredCount,Rollout:rolloutState,Reason:rolloutStateReason}}' \
+            --output yaml \
+            --region "${region}" 2>/dev/null || echo "  (service not found — stack may not be deployed yet)"
+    done
+
+    echo ""
+
+    # Show recent task status
+    echo -e "${BLUE}── Recent Tasks ──${NC}"
+    local task_arns
+    task_arns=$(aws ecs list-tasks \
+        --cluster "${cluster}" \
+        --query 'taskArns[*]' \
+        --output text \
+        --region "${region}" 2>/dev/null) || true
+
+    if [ -n "${task_arns}" ] && [ "${task_arns}" != "None" ]; then
+        aws ecs describe-tasks \
+            --cluster "${cluster}" \
+            --tasks ${task_arns} \
+            --query 'tasks[*].{TaskArn:taskArn,Status:lastStatus,DesiredStatus:desiredStatus,StopReason:stoppedReason,Health:healthStatus,StartedAt:startedAt,Group:group}' \
+            --output table \
+            --region "${region}" 2>/dev/null || echo "  (could not describe tasks)"
+    else
+        log_warn "No running tasks found in cluster."
+    fi
+
+    # Show recently stopped tasks (failures)
+    echo ""
+    echo -e "${BLUE}── Recently Stopped Tasks (last failures) ──${NC}"
+    local stopped_arns
+    stopped_arns=$(aws ecs list-tasks \
+        --cluster "${cluster}" \
+        --desired-status STOPPED \
+        --query 'taskArns[0:5]' \
+        --output text \
+        --region "${region}" 2>/dev/null) || true
+
+    if [ -n "${stopped_arns}" ] && [ "${stopped_arns}" != "None" ]; then
+        aws ecs describe-tasks \
+            --cluster "${cluster}" \
+            --tasks ${stopped_arns} \
+            --query 'tasks[*].{TaskArn:taskArn,Status:lastStatus,StopCode:stopCode,StopReason:stoppedReason,StartedAt:startedAt,StoppedAt:stoppedAt,Group:group}' \
+            --output table \
+            --region "${region}" 2>/dev/null || echo "  (could not describe stopped tasks)"
+    else
+        log_info "No recently stopped tasks."
+    fi
+
+    echo ""
+    log_info "Useful commands for further debugging:"
+    echo "  # View API container logs:"
+    echo "  aws logs tail /ecs/decoration-preview/api --follow --region ${region}"
+    echo ""
+    echo "  # View render worker logs:"
+    echo "  aws logs tail /ecs/decoration-preview/render --follow --region ${region}"
+    echo ""
+    echo "  # ECS Exec into a running task (requires enable_execute_command=True):"
+    echo "  aws ecs execute-command --cluster ${cluster} --task <TASK_ID> \\"
+    echo "    --container ApiContainer --interactive --command '/bin/sh' --region ${region}"
+    echo ""
+    echo "  # View ECS service events (shows deployment issues):"
+    echo "  aws ecs describe-services --cluster ${cluster} --services decoration-preview-api \\"
+    echo "    --query 'services[0].events[0:10]' --output table --region ${region}"
+}
+
 # ── Main ───────────────────────────────────────────────────
 case "${1:-help}" in
     bootstrap)
@@ -327,8 +609,17 @@ case "${1:-help}" in
     destroy)
         cmd_destroy
         ;;
+    cleanup)
+        cmd_cleanup
+        ;;
+    cancel-stuck)
+        cmd_cancel_stuck
+        ;;
     status)
         cmd_status
+        ;;
+    ecs-status)
+        cmd_ecs_status
         ;;
     help|*)
         echo "Decoration Preview Service - AWS Deployment"
@@ -342,7 +633,10 @@ case "${1:-help}" in
         echo "  deploy           Deploy all stacks"
         echo "  deploy-stack <n> Deploy a specific stack"
         echo "  destroy          Destroy all stacks (CAUTION!)"
+        echo "  cleanup          Delete failed stacks + detect stuck stacks"
+        echo "  cancel-stuck     Cancel stacks stuck in CREATE/UPDATE_IN_PROGRESS"
         echo "  status           Show deployment outputs"
+        echo "  ecs-status       Show ECS service/task status (debug deploys)"
         echo "  help             Show this help message"
         ;;
 esac

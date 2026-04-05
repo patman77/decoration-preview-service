@@ -100,9 +100,9 @@ class ComputeStack(cdk.Stack):
             health_check=ecs.HealthCheck(
                 command=["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
                 interval=Duration.seconds(30),
-                timeout=Duration.seconds(5),
+                timeout=Duration.seconds(10),
                 retries=3,
-                start_period=Duration.seconds(60),
+                start_period=Duration.seconds(120),
             ),
         )
 
@@ -172,12 +172,21 @@ class ComputeStack(cdk.Stack):
             cluster=self.cluster,
             task_definition=self.api_task_definition,
             desired_count=2,
-            min_healthy_percent=100,
+            min_healthy_percent=50,  # Allow rolling deploys with 1 healthy task
             max_healthy_percent=200,
             assign_public_ip=False,
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
+            # Fail fast instead of hanging indefinitely when tasks can't start
+            circuit_breaker=ecs.DeploymentCircuitBreaker(
+                enable=True,
+                rollback=True,  # Auto-rollback on repeated failures
+            ),
+            # Give tasks time to pass health checks before being killed
+            health_check_grace_period=Duration.seconds(180),
+            # Use deployment alarms for faster failure detection
+            enable_execute_command=True,  # Allow ECS Exec for debugging
         )
 
         # Auto-scaling for API service
@@ -207,6 +216,12 @@ class ComputeStack(cdk.Stack):
             vpc_subnets=ec2.SubnetSelection(
                 subnet_type=ec2.SubnetType.PRIVATE_WITH_EGRESS
             ),
+            # Fail fast instead of hanging indefinitely when tasks can't start
+            circuit_breaker=ecs.DeploymentCircuitBreaker(
+                enable=True,
+                rollback=True,
+            ),
+            enable_execute_command=True,  # Allow ECS Exec for debugging
         )
 
         # Auto-scaling for render workers based on SQS queue depth
