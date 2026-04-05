@@ -1,21 +1,36 @@
-"""Minimal HTTP server – stdlib only, ZERO external dependencies.
+"""FastAPI application entry point.
 
-This replaces FastAPI/uvicorn with Python's built-in http.server to
-guarantee a successful ECS deployment. Once the infrastructure is
-proven green, we can layer FastAPI back in.
-
-Listens on port 8000 and responds to:
-  GET /health  → 200 {"status": "healthy", ...}
-  GET /         → 200 {"service": "decoration-preview-api", ...}
-  Everything else → 404
+This module initializes the FastAPI application with:
+- CORS middleware for cross-origin requests
+- Custom exception handlers
+- API routes
+- Health check endpoint
+- Startup/shutdown lifecycle events
 """
 
-import json
 import logging
 import os
 import sys
 import time
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+
+from fastapi import FastAPI, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
+from backend.app.api.routes import router as api_router
+from backend.app.core.config import get_settings
+from backend.app.core.exceptions import (
+    ElementNotFoundError,
+    FileValidationError,
+    RenderJobNotFoundError,
+    element_not_found_handler,
+    file_validation_handler,
+    generic_exception_handler,
+    render_job_not_found_handler,
+)
+from backend.app.core.logging import get_logger
 
 # ---------------------------------------------------------------------------
 # Logging – immediate stdout so CloudWatch picks it up
@@ -25,70 +40,128 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
     stream=sys.stdout,
 )
-logger = logging.getLogger("api_server")
+logger = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Startup banner
-# ---------------------------------------------------------------------------
-logger.info("=" * 60)
-logger.info("Minimal API server loading (stdlib http.server)")
-logger.info("Python %s", sys.version)
-logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
-logger.info("ENVIRONMENT=%s", os.environ.get("ENVIRONMENT", "unknown"))
-logger.info("=" * 60)
-
+# Startup time tracking
 START_TIME = time.time()
 
 
-class HealthHandler(BaseHTTPRequestHandler):
-    """Dead-simple request handler."""
+# ---------------------------------------------------------------------------
+# Lifespan context manager for startup/shutdown events
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Handle application startup and shutdown events."""
+    # Startup
+    settings = get_settings()
+    logger.info("=" * 60)
+    logger.info("Decoration Preview Service starting...")
+    logger.info("Python %s", sys.version)
+    logger.info("PID %s | CWD %s", os.getpid(), os.getcwd())
+    logger.info("Environment: %s", settings.environment)
+    logger.info("Debug: %s", settings.debug)
+    logger.info("Log level: %s", settings.log_level)
+    logger.info("=" * 60)
 
-    def _send_json(self, code: int, body: dict) -> None:
-        payload = json.dumps(body).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
+    yield
 
-    def do_GET(self) -> None:  # noqa: N802
-        logger.info("GET %s from %s", self.path, self.client_address[0])
-
-        if self.path == "/health":
-            uptime = int(time.time() - START_TIME)
-            self._send_json(200, {
-                "status": "healthy",
-                "version": "0.1.0-minimal",
-                "environment": os.environ.get("ENVIRONMENT", "unknown"),
-                "uptime_seconds": uptime,
-            })
-        elif self.path == "/":
-            self._send_json(200, {
-                "service": "decoration-preview-api",
-                "version": "0.1.0-minimal",
-                "description": "Minimal stdlib server – infrastructure validation mode",
-                "health_url": "/health",
-            })
-        else:
-            self._send_json(404, {"error": "not found", "path": self.path})
-
-    # Suppress default stderr logging (we use our own logger)
-    def log_message(self, format, *args):
-        pass
+    # Shutdown
+    logger.info("Decoration Preview Service shutting down...")
 
 
-def main() -> None:
-    port = int(os.environ.get("PORT", "8000"))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info("Listening on 0.0.0.0:%d", port)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    finally:
-        server.server_close()
-        logger.info("Server closed.")
+# ---------------------------------------------------------------------------
+# Create FastAPI application
+# ---------------------------------------------------------------------------
+settings = get_settings()
+
+app = FastAPI(
+    title=settings.app_name,
+    description="Cloud-native API for rendering 2D artwork onto 3D elements with async processing",
+    version=settings.app_version,
+    docs_url="/docs",
+    redoc_url="/redoc",
+    openapi_url="/openapi.json",
+    lifespan=lifespan,
+)
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# CORS Middleware
+# ---------------------------------------------------------------------------
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.allowed_origins + ["*"],  # Add * for development flexibility
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Exception Handlers
+# ---------------------------------------------------------------------------
+app.add_exception_handler(RenderJobNotFoundError, render_job_not_found_handler)
+app.add_exception_handler(FileValidationError, file_validation_handler)
+app.add_exception_handler(ElementNotFoundError, element_not_found_handler)
+app.add_exception_handler(Exception, generic_exception_handler)
+
+
+# ---------------------------------------------------------------------------
+# Include API routers
+# ---------------------------------------------------------------------------
+app.include_router(api_router)
+
+
+# ---------------------------------------------------------------------------
+# Health check endpoint (not part of API router - always accessible)
+# ---------------------------------------------------------------------------
+@app.get("/health", tags=["Health"])
+async def health_check():
+    """Health check endpoint for load balancers and container orchestration."""
+    uptime = int(time.time() - START_TIME)
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "status": "healthy",
+            "service": "decoration-preview-api",
+            "version": settings.app_version,
+            "environment": settings.environment,
+            "uptime_seconds": uptime,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+
+
+@app.get("/", tags=["Root"])
+async def root():
+    """Root endpoint with service information."""
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={
+            "service": "decoration-preview-api",
+            "version": settings.app_version,
+            "description": "Cloud-native API for rendering 2D artwork onto 3D elements",
+            "documentation": "/docs",
+            "health_check": "/health",
+            "api_prefix": settings.api_prefix,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Request logging middleware
+# ---------------------------------------------------------------------------
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """Log all incoming requests."""
+    start = time.time()
+    response = await call_next(request)
+    duration = time.time() - start
+    logger.info(
+        "%s %s - %d (%.3fs)",
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration,
+    )
+    return response
