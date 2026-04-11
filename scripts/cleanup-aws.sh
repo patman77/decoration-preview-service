@@ -6,6 +6,45 @@ CLUSTER="decoration-preview-cluster"
 
 echo "=== AWS cleanup started for region: $REGION ==="
 
+delete_nat_gateways() {
+  echo "Deleting NAT gateways (major hourly cost source)..."
+  NAT_GWS=$(aws ec2 describe-nat-gateways \
+    --region "$REGION" \
+    --filter Name=state,Values=available,pending,failed \
+    --query 'NatGateways[].NatGatewayId' \
+    --output text 2>/dev/null || true)
+
+  if [ -n "${NAT_GWS:-}" ]; then
+    for NAT_GW in $NAT_GWS; do
+      echo "Deleting NAT gateway $NAT_GW"
+      aws ec2 delete-nat-gateway \
+        --region "$REGION" \
+        --nat-gateway-id "$NAT_GW" >/dev/null || true
+    done
+  else
+    echo "No NAT gateways found."
+  fi
+}
+
+release_elastic_ips() {
+  echo "Releasing unattached Elastic IPs..."
+  EIP_ALLOCS=$(aws ec2 describe-addresses \
+    --region "$REGION" \
+    --query 'Addresses[?AssociationId==null].AllocationId' \
+    --output text 2>/dev/null || true)
+
+  if [ -n "${EIP_ALLOCS:-}" ]; then
+    for EIP_ALLOC in $EIP_ALLOCS; do
+      echo "Releasing EIP allocation $EIP_ALLOC"
+      aws ec2 release-address \
+        --region "$REGION" \
+        --allocation-id "$EIP_ALLOC" >/dev/null || true
+    done
+  else
+    echo "No unattached Elastic IPs found."
+  fi
+}
+
 echo
 echo "1) List ECS services"
 SERVICES=$(aws ecs list-services \
@@ -74,7 +113,11 @@ else
 fi
 
 echo
-echo "5) Delete load balancers"
+echo "5) Delete NAT gateways"
+delete_nat_gateways
+
+echo
+echo "6) Delete load balancers"
 LB_ARNS=$(aws elbv2 describe-load-balancers \
   --region "$REGION" \
   --query 'LoadBalancers[].LoadBalancerArn' \
@@ -96,7 +139,7 @@ echo "Waiting for ALB deletion propagation..."
 sleep 20
 
 echo
-echo "6) Delete target groups"
+echo "7) Delete target groups"
 TG_ARNS=$(aws elbv2 describe-target-groups \
   --region "$REGION" \
   --query 'TargetGroups[].TargetGroupArn' \
@@ -114,7 +157,7 @@ else
 fi
 
 echo
-echo "7) Delete ECR repositories and images"
+echo "8) Delete ECR repositories and images"
 REPOS=$(aws ecr describe-repositories \
   --region "$REGION" \
   --query 'repositories[].repositoryName' \
@@ -133,7 +176,7 @@ else
 fi
 
 echo
-echo "8) Delete CloudWatch log groups"
+echo "9) Delete CloudWatch log groups"
 LOG_GROUPS=$(aws logs describe-log-groups \
   --region "$REGION" \
   --query 'logGroups[].logGroupName' \
@@ -151,7 +194,11 @@ else
 fi
 
 echo
-echo "9) Optional: list remaining cost-relevant resources"
+echo "10) Release unattached Elastic IPs"
+release_elastic_ips
+
+echo
+echo "11) Optional: list remaining cost-relevant resources"
 echo "--- ECS clusters ---"
 aws ecs list-clusters --region "$REGION" || true
 
@@ -163,6 +210,12 @@ aws ecr describe-repositories --region "$REGION" || true
 
 echo "--- Log groups ---"
 aws logs describe-log-groups --region "$REGION" || true
+
+echo "--- NAT gateways ---"
+aws ec2 describe-nat-gateways --region "$REGION" --output text || true
+
+echo "--- Elastic IPs ---"
+aws ec2 describe-addresses --region "$REGION" --output text || true
 
 echo
 echo "=== Cleanup finished ==="
