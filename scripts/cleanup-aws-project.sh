@@ -52,6 +52,9 @@ Options:
   --delete-load-balancers
       Also delete matching load balancers and target groups.
 
+  --delete-network
+      Also delete matching NAT gateways and release matching Elastic IPs.
+
   --delete-ecs
       Also scale down and delete matching ECS services and their tasks.
 
@@ -93,6 +96,7 @@ DRY_RUN=0
 DELETE_LOG_GROUPS=0
 DELETE_ECR=0
 DELETE_LOAD_BALANCERS=0
+DELETE_NETWORK=0
 DELETE_ECS=0
 FORCE=0
 
@@ -142,6 +146,10 @@ while [[ $# -gt 0 ]]; do
       DELETE_LOAD_BALANCERS=1
       shift
       ;;
+    --delete-network)
+      DELETE_NETWORK=1
+      shift
+      ;;
     --delete-ecs)
       DELETE_ECS=1
       shift
@@ -150,6 +158,7 @@ while [[ $# -gt 0 ]]; do
       DELETE_LOG_GROUPS=1
       DELETE_ECR=1
       DELETE_LOAD_BALANCERS=1
+      DELETE_NETWORK=1
       DELETE_ECS=1
       shift
       ;;
@@ -199,14 +208,15 @@ echo "Name filter:            $NAME_FILTER"
 echo "Profile:                ${PROFILE:-<default>}"
 echo "Delete ECS:             $DELETE_ECS"
 echo "Delete load balancers:  $DELETE_LOAD_BALANCERS"
+echo "Delete network:         $DELETE_NETWORK"
 echo "Delete ECR:             $DELETE_ECR"
 echo "Delete log groups:      $DELETE_LOG_GROUPS"
 echo "Dry run:                $DRY_RUN"
 echo
 
-if [[ "$DELETE_ECS" -eq 0 && "$DELETE_LOAD_BALANCERS" -eq 0 && "$DELETE_ECR" -eq 0 && "$DELETE_LOG_GROUPS" -eq 0 ]]; then
+if [[ "$DELETE_ECS" -eq 0 && "$DELETE_LOAD_BALANCERS" -eq 0 && "$DELETE_NETWORK" -eq 0 && "$DELETE_ECR" -eq 0 && "$DELETE_LOG_GROUPS" -eq 0 ]]; then
   echo "Nothing selected for deletion."
-  echo "Use one of: --delete-ecs, --delete-load-balancers, --delete-ecr, --delete-log-groups, or --delete-all"
+  echo "Use one of: --delete-ecs, --delete-load-balancers, --delete-network, --delete-ecr, --delete-log-groups, or --delete-all"
   exit 1
 fi
 
@@ -348,8 +358,60 @@ delete_load_balancers() {
   echo
 }
 
+delete_network() {
+  echo "3) Network cleanup (NAT gateways + EIPs)"
+
+  NAT_INFO=$(aws "${AWS_ARGS[@]}" ec2 describe-nat-gateways --output json 2>/dev/null || true)
+  MATCHED_NAT_IDS=$(echo "$NAT_INFO" | jq -r --arg f "$NAME_FILTER" '
+    (.NatGateways // [])
+    | map(select(
+        ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+        or ((.NatGatewayId // "") | contains($f))
+      ))
+    | .[]
+    | .NatGatewayId
+  ')
+
+  if [[ -n "${MATCHED_NAT_IDS:-}" ]]; then
+    echo "Deleting matching NAT gateways..."
+    while IFS= read -r nat_id; do
+      [[ -z "$nat_id" ]] && continue
+      run_cmd "aws ${AWS_ARGS[*]} ec2 delete-nat-gateway --nat-gateway-id \"$nat_id\" >/dev/null || true"
+    done <<< "$MATCHED_NAT_IDS"
+  else
+    echo "No matching NAT gateways found."
+  fi
+
+  EIP_INFO=$(aws "${AWS_ARGS[@]}" ec2 describe-addresses --output json 2>/dev/null || true)
+  MATCHED_EIP_ALLOC_IDS=$(echo "$EIP_INFO" | jq -r --arg f "$NAME_FILTER" '
+    (.Addresses // [])
+    | map(select(
+        .AssociationId == null and
+        (
+          ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+          or ((.PublicIp // "") | contains($f))
+          or ((.AllocationId // "") | contains($f))
+        )
+      ))
+    | .[]
+    | .AllocationId
+  ')
+
+  if [[ -n "${MATCHED_EIP_ALLOC_IDS:-}" ]]; then
+    echo "Releasing matching unattached Elastic IPs..."
+    while IFS= read -r allocation_id; do
+      [[ -z "$allocation_id" ]] && continue
+      run_cmd "aws ${AWS_ARGS[*]} ec2 release-address --allocation-id \"$allocation_id\" >/dev/null || true"
+    done <<< "$MATCHED_EIP_ALLOC_IDS"
+  else
+    echo "No matching unattached Elastic IPs found."
+  fi
+
+  echo
+}
+
 delete_ecr() {
-  echo "3) ECR cleanup"
+  echo "4) ECR cleanup"
 
   REPOS=$(aws "${AWS_ARGS[@]}" ecr describe-repositories \
     --query 'repositories[].repositoryName' \
@@ -373,7 +435,7 @@ delete_ecr() {
 }
 
 delete_log_groups() {
-  echo "4) CloudWatch log group cleanup"
+  echo "5) CloudWatch log group cleanup"
 
   LOG_GROUPS=$(aws "${AWS_ARGS[@]}" logs describe-log-groups \
     --query 'logGroups[].logGroupName' \
@@ -397,7 +459,7 @@ delete_log_groups() {
 }
 
 show_remaining() {
-  echo "5) Remaining matching resources"
+  echo "6) Remaining matching resources"
 
   echo "--- ECS services ---"
   aws "${AWS_ARGS[@]}" ecs list-services \
@@ -439,10 +501,39 @@ show_remaining() {
       | .[]
       | .logGroupName
     ' || true
+
+  echo "--- NAT gateways ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-nat-gateways \
+    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+      (.NatGateways // [])
+      | map(select(
+          ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+          or ((.NatGatewayId // "") | contains($f))
+      ))
+      | .[]
+      | .NatGatewayId
+    ' || true
+
+  echo "--- Unattached Elastic IPs ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-addresses \
+    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+      (.Addresses // [])
+      | map(select(
+          .AssociationId == null and
+          (
+            ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+            or ((.PublicIp // "") | contains($f))
+            or ((.AllocationId // "") | contains($f))
+          )
+      ))
+      | .[]
+      | .PublicIp + "  " + .AllocationId
+    ' || true
 }
 
 [[ "$DELETE_ECS" -eq 1 ]] && delete_ecs
 [[ "$DELETE_LOAD_BALANCERS" -eq 1 ]] && delete_load_balancers
+[[ "$DELETE_NETWORK" -eq 1 ]] && delete_network
 [[ "$DELETE_ECR" -eq 1 ]] && delete_ecr
 [[ "$DELETE_LOG_GROUPS" -eq 1 ]] && delete_log_groups
 
