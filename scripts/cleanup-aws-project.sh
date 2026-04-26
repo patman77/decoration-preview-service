@@ -7,15 +7,16 @@ Usage:
   cleanup-aws-project.sh [options]
 
 Description:
-  Cleans up AWS resources for a project by matching names and ECS cluster resources.
+  Cleans up AWS resources for a project by matching names/tags and ECS cluster resources.
 
 Defaults:
-  --region           eu-central-1
-  --cluster          decoration-preview-cluster
-  --name-filter      decoration-preview
-  --wait-ecs         20
-  --wait-lb          20
-  --wait-post-stop   15
+  --region              eu-central-1
+  --cluster             decoration-preview-cluster
+  --name-filter         decoration-preview
+  --specific-eip        52.58.157.195
+  --wait-ecs            20
+  --wait-lb             20
+  --wait-post-stop      15
 
 Options:
   --region REGION
@@ -27,6 +28,9 @@ Options:
   --name-filter FILTER
       Substring used to match resources for deletion.
       Examples: decoration-preview, my-stack, demo-app
+
+  --specific-eip PUBLIC_IP
+      Extra Elastic IP to release if unattached, even if it does not match --name-filter.
 
   --profile PROFILE
       AWS CLI profile to use.
@@ -53,10 +57,19 @@ Options:
       Also delete matching load balancers and target groups.
 
   --delete-network
-      Also delete matching NAT gateways and release matching Elastic IPs.
+      Also delete matching NAT gateways and release matching/unattached Elastic IPs.
 
   --delete-ecs
       Also scale down and delete matching ECS services and their tasks.
+
+  --delete-waf
+      Also delete matching WAFv2 Web ACLs (including associated rules and associations).
+
+  --delete-kms
+      Also schedule deletion for matching customer-managed KMS keys.
+
+  --delete-storage
+      Also deregister matching AMIs and delete matching EBS snapshots.
 
   --delete-all
       Enable all delete categories above.
@@ -69,7 +82,7 @@ Options:
 
 Examples:
   Dry run:
-    ./cleanup-aws-project.sh --cluster decoration-preview-cluster --name-filter decoration-preview --dry-run
+    ./cleanup-aws-project.sh --cluster decoration-preview-cluster --name-filter decoration-preview --delete-all --dry-run
 
   Delete everything matching filter:
     ./cleanup-aws-project.sh --cluster decoration-preview-cluster --name-filter decoration-preview --delete-all
@@ -81,12 +94,14 @@ Notes:
   - Requires: aws, jq
   - Make sure your AWS credentials are configured.
   - Matching is substring-based, so choose --name-filter carefully.
+  - KMS deletion is scheduled (minimum 7-day waiting period by AWS).
 EOF
 }
 
 REGION="eu-central-1"
 CLUSTER="decoration-preview-cluster"
 NAME_FILTER="decoration-preview"
+SPECIFIC_EIP_IP="52.58.157.195"
 PROFILE=""
 WAIT_ECS=20
 WAIT_POST_STOP=15
@@ -98,6 +113,9 @@ DELETE_ECR=0
 DELETE_LOAD_BALANCERS=0
 DELETE_NETWORK=0
 DELETE_ECS=0
+DELETE_WAF=0
+DELETE_KMS=0
+DELETE_STORAGE=0
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -112,6 +130,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --name-filter)
       NAME_FILTER="${2:?Missing value for --name-filter}"
+      shift 2
+      ;;
+    --specific-eip)
+      SPECIFIC_EIP_IP="${2:?Missing value for --specific-eip}"
       shift 2
       ;;
     --profile)
@@ -154,12 +176,27 @@ while [[ $# -gt 0 ]]; do
       DELETE_ECS=1
       shift
       ;;
+    --delete-waf)
+      DELETE_WAF=1
+      shift
+      ;;
+    --delete-kms)
+      DELETE_KMS=1
+      shift
+      ;;
+    --delete-storage)
+      DELETE_STORAGE=1
+      shift
+      ;;
     --delete-all)
       DELETE_LOG_GROUPS=1
       DELETE_ECR=1
       DELETE_LOAD_BALANCERS=1
       DELETE_NETWORK=1
       DELETE_ECS=1
+      DELETE_WAF=1
+      DELETE_KMS=1
+      DELETE_STORAGE=1
       shift
       ;;
     --force)
@@ -193,6 +230,11 @@ if [[ -n "$PROFILE" ]]; then
   AWS_ARGS+=(--profile "$PROFILE")
 fi
 
+contains_filter() {
+  local value="${1:-}"
+  [[ "$value" == *"$NAME_FILTER"* ]]
+}
+
 run_cmd() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
     echo "[dry-run] $*"
@@ -205,18 +247,22 @@ echo "=== Targeted AWS cleanup started ==="
 echo "Region:                 $REGION"
 echo "Cluster:                $CLUSTER"
 echo "Name filter:            $NAME_FILTER"
+echo "Specific EIP:           $SPECIFIC_EIP_IP"
 echo "Profile:                ${PROFILE:-<default>}"
 echo "Delete ECS:             $DELETE_ECS"
 echo "Delete load balancers:  $DELETE_LOAD_BALANCERS"
 echo "Delete network:         $DELETE_NETWORK"
+echo "Delete WAF:             $DELETE_WAF"
+echo "Delete KMS:             $DELETE_KMS"
+echo "Delete storage:         $DELETE_STORAGE"
 echo "Delete ECR:             $DELETE_ECR"
 echo "Delete log groups:      $DELETE_LOG_GROUPS"
 echo "Dry run:                $DRY_RUN"
 echo
 
-if [[ "$DELETE_ECS" -eq 0 && "$DELETE_LOAD_BALANCERS" -eq 0 && "$DELETE_NETWORK" -eq 0 && "$DELETE_ECR" -eq 0 && "$DELETE_LOG_GROUPS" -eq 0 ]]; then
+if [[ "$DELETE_ECS" -eq 0 && "$DELETE_LOAD_BALANCERS" -eq 0 && "$DELETE_NETWORK" -eq 0 && "$DELETE_WAF" -eq 0 && "$DELETE_KMS" -eq 0 && "$DELETE_STORAGE" -eq 0 && "$DELETE_ECR" -eq 0 && "$DELETE_LOG_GROUPS" -eq 0 ]]; then
   echo "Nothing selected for deletion."
-  echo "Use one of: --delete-ecs, --delete-load-balancers, --delete-network, --delete-ecr, --delete-log-groups, or --delete-all"
+  echo "Use one of: --delete-ecs, --delete-load-balancers, --delete-network, --delete-waf, --delete-kms, --delete-storage, --delete-ecr, --delete-log-groups, or --delete-all"
   exit 1
 fi
 
@@ -244,7 +290,7 @@ delete_ecs() {
     for arn in $SERVICE_ARNS; do
       local name
       name=$(basename "$arn")
-      if [[ "$name" == *"$NAME_FILTER"* ]]; then
+      if contains_filter "$name"; then
         matched_services+=("$name")
       fi
     done
@@ -282,7 +328,7 @@ delete_ecs() {
 
     for service in "${matched_services[@]}"; do
       MATCHING_TASKS=$(echo "$TASK_DETAILS" | jq -r --arg svc "$service" '
-        .tasks[]
+        .tasks[]?
         | select((.group // "") == ("service:" + $svc))
         | .taskArn
       ')
@@ -365,7 +411,7 @@ delete_network() {
   MATCHED_NAT_IDS=$(echo "$NAT_INFO" | jq -r --arg f "$NAME_FILTER" '
     (.NatGateways // [])
     | map(select(
-        ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+        ((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ") | contains($f))
         or ((.NatGatewayId // "") | contains($f))
       ))
     | .[]
@@ -388,7 +434,7 @@ delete_network() {
     | map(select(
         .AssociationId == null and
         (
-          ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
+          ((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ") | contains($f))
           or ((.PublicIp // "") | contains($f))
           or ((.AllocationId // "") | contains($f))
         )
@@ -407,11 +453,239 @@ delete_network() {
     echo "No matching unattached Elastic IPs found."
   fi
 
+  local specific_alloc specific_assoc
+  specific_alloc=$(echo "$EIP_INFO" | jq -r --arg ip "$SPECIFIC_EIP_IP" '
+    (.Addresses // []) | map(select((.PublicIp // "") == $ip)) | .[0].AllocationId // empty
+  ')
+  specific_assoc=$(echo "$EIP_INFO" | jq -r --arg ip "$SPECIFIC_EIP_IP" '
+    (.Addresses // []) | map(select((.PublicIp // "") == $ip)) | .[0].AssociationId // empty
+  ')
+
+  if [[ -n "$specific_alloc" ]]; then
+    if [[ -z "$specific_assoc" ]]; then
+      echo "Releasing specific unattached Elastic IP ${SPECIFIC_EIP_IP} (${specific_alloc})"
+      run_cmd "aws ${AWS_ARGS[*]} ec2 release-address --allocation-id \"$specific_alloc\" >/dev/null || true"
+    else
+      echo "Specific Elastic IP ${SPECIFIC_EIP_IP} is attached (${specific_assoc}); not releasing."
+    fi
+  else
+    echo "Specific Elastic IP ${SPECIFIC_EIP_IP} not found in this region."
+  fi
+
+  echo
+}
+
+delete_waf() {
+  echo "4) WAF cleanup (Web ACLs + associations + rules)"
+
+  local scopes=("REGIONAL" "CLOUDFRONT")
+  local resource_types=(
+    "APPLICATION_LOAD_BALANCER"
+    "API_GATEWAY"
+    "APPSYNC"
+    "COGNITO_USER_POOL"
+    "APP_RUNNER_SERVICE"
+    "VERIFIED_ACCESS_INSTANCE"
+    "AMPLIFY"
+  )
+
+  for scope in "${scopes[@]}"; do
+    local waf_region="$REGION"
+    if [[ "$scope" == "CLOUDFRONT" ]]; then
+      waf_region="us-east-1"
+    fi
+
+    local waf_args=(--region "$waf_region")
+    if [[ -n "$PROFILE" ]]; then
+      waf_args+=(--profile "$PROFILE")
+    fi
+
+    WAF_INFO=$(aws "${waf_args[@]}" wafv2 list-web-acls --scope "$scope" --output json 2>/dev/null || true)
+    local matched=0
+
+    while IFS= read -r acl; do
+      [[ -z "$acl" ]] && continue
+
+      local acl_name acl_id acl_arn
+      acl_name=$(echo "$acl" | jq -r '.Name')
+      acl_id=$(echo "$acl" | jq -r '.Id')
+      acl_arn=$(echo "$acl" | jq -r '.ARN')
+
+      local tags_json tags_blob
+      tags_json=$(aws "${waf_args[@]}" wafv2 list-tags-for-resource --resource-arn "$acl_arn" --output json 2>/dev/null || true)
+      tags_blob=$(echo "${tags_json:-{\"TagInfoForResource\":{\"TagList\":[]}}}" | jq -r '(.TagInfoForResource.TagList // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")')
+
+      if ! contains_filter "$acl_name" && ! contains_filter "$tags_blob" && ! contains_filter "$acl_arn"; then
+        continue
+      fi
+
+      matched=1
+      echo "Matched WAF ACL: $acl_name ($scope)"
+
+      for rt in "${resource_types[@]}"; do
+        local resources
+        resources=$(aws "${waf_args[@]}" wafv2 list-resources-for-web-acl \
+          --web-acl-arn "$acl_arn" \
+          --resource-type "$rt" \
+          --query 'ResourceArns[]' \
+          --output text 2>/dev/null || true)
+
+        if [[ -n "${resources:-}" ]]; then
+          for resource_arn in $resources; do
+            run_cmd "aws ${waf_args[*]} wafv2 disassociate-web-acl --resource-arn \"$resource_arn\" >/dev/null || true"
+          done
+        fi
+      done
+
+      local lock_token
+      lock_token=$(aws "${waf_args[@]}" wafv2 get-web-acl \
+        --name "$acl_name" \
+        --id "$acl_id" \
+        --scope "$scope" \
+        --query 'LockToken' \
+        --output text 2>/dev/null || true)
+
+      if [[ -z "${lock_token:-}" || "$lock_token" == "None" ]]; then
+        echo "Unable to get lock token for ACL $acl_name; skipping delete."
+        continue
+      fi
+
+      run_cmd "aws ${waf_args[*]} wafv2 delete-web-acl --name \"$acl_name\" --id \"$acl_id\" --scope \"$scope\" --lock-token \"$lock_token\" >/dev/null || true"
+    done < <(echo "$WAF_INFO" | jq -c '.WebACLs[]?')
+
+    if [[ "$matched" -eq 0 ]]; then
+      echo "No matching WAF ACLs found for scope ${scope}."
+    fi
+  done
+
+  echo
+}
+
+delete_kms() {
+  echo "5) KMS cleanup (customer-managed keys)"
+
+  KEY_IDS=$(aws "${AWS_ARGS[@]}" kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null || true)
+  local matched=0
+
+  if [[ -n "${KEY_IDS:-}" ]]; then
+    for key_id in $KEY_IDS; do
+      KEY_INFO=$(aws "${AWS_ARGS[@]}" kms describe-key --key-id "$key_id" --output json 2>/dev/null || true)
+      [[ -z "${KEY_INFO:-}" ]] && continue
+
+      local manager state arn description
+      manager=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyManager // empty')
+      state=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyState // empty')
+      arn=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Arn // empty')
+      description=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Description // empty')
+
+      if [[ "$manager" != "CUSTOMER" ]]; then
+        continue
+      fi
+
+      if [[ "$state" == "PendingDeletion" ]]; then
+        continue
+      fi
+
+      local aliases tags alias_blob tag_blob match_text
+      aliases=$(aws "${AWS_ARGS[@]}" kms list-aliases --key-id "$key_id" --output json 2>/dev/null || true)
+      tags=$(aws "${AWS_ARGS[@]}" kms list-resource-tags --key-id "$key_id" --output json 2>/dev/null || true)
+
+      alias_blob=$(echo "${aliases:-{\"Aliases\":[]}}" | jq -r '(.Aliases // []) | map(.AliasName // "") | join(" ")')
+      tag_blob=$(echo "${tags:-{\"Tags\":[]}}" | jq -r '(.Tags // []) | map((.TagKey // "") + "=" + (.TagValue // "")) | join(" ")')
+      match_text="$arn $description $alias_blob $tag_blob"
+
+      if ! contains_filter "$match_text"; then
+        continue
+      fi
+
+      matched=1
+      echo "Matched KMS key: ${arn:-$key_id}"
+      run_cmd "aws ${AWS_ARGS[*]} kms disable-key --key-id \"$key_id\" >/dev/null 2>&1 || true"
+      run_cmd "aws ${AWS_ARGS[*]} kms schedule-key-deletion --key-id \"$key_id\" --pending-window-in-days 7 >/dev/null || true"
+    done
+  fi
+
+  if [[ "$matched" -eq 0 ]]; then
+    echo "No matching customer-managed KMS keys found."
+  fi
+
+  echo
+}
+
+delete_storage() {
+  echo "6) Storage cleanup (AMIs + EBS snapshots)"
+
+  IMAGE_INFO=$(aws "${AWS_ARGS[@]}" ec2 describe-images --owners self --output json 2>/dev/null || true)
+
+  MATCHED_IMAGE_IDS=$(echo "$IMAGE_INFO" | jq -r --arg f "$NAME_FILTER" '
+    (.Images // [])
+    | map(select(
+        ((.ImageId // "") | contains($f))
+        or ((.Name // "") | contains($f))
+        or ((.Description // "") | contains($f))
+        or (((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")) | contains($f))
+      ))
+    | .[]
+    | .ImageId
+  ')
+
+  MATCHED_IMAGE_SNAPSHOTS=$(echo "$IMAGE_INFO" | jq -r --arg f "$NAME_FILTER" '
+    (.Images // [])
+    | map(select(
+        ((.ImageId // "") | contains($f))
+        or ((.Name // "") | contains($f))
+        or ((.Description // "") | contains($f))
+        or (((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")) | contains($f))
+      ))
+    | .[]
+    | .BlockDeviceMappings[]?.Ebs?.SnapshotId // empty
+  ' | sort -u)
+
+  if [[ -n "${MATCHED_IMAGE_IDS:-}" ]]; then
+    echo "Deregistering matching AMIs..."
+    while IFS= read -r image_id; do
+      [[ -z "$image_id" ]] && continue
+      run_cmd "aws ${AWS_ARGS[*]} ec2 deregister-image --image-id \"$image_id\" >/dev/null || true"
+    done <<< "$MATCHED_IMAGE_IDS"
+  else
+    echo "No matching AMIs found."
+  fi
+
+  if [[ -n "${MATCHED_IMAGE_SNAPSHOTS:-}" ]]; then
+    echo "Deleting snapshots associated with matching AMIs..."
+    while IFS= read -r snap_id; do
+      [[ -z "$snap_id" ]] && continue
+      run_cmd "aws ${AWS_ARGS[*]} ec2 delete-snapshot --snapshot-id \"$snap_id\" >/dev/null || true"
+    done <<< "$MATCHED_IMAGE_SNAPSHOTS"
+  fi
+
+  SNAPSHOT_INFO=$(aws "${AWS_ARGS[@]}" ec2 describe-snapshots --owner-ids self --output json 2>/dev/null || true)
+  MATCHED_SNAPSHOTS=$(echo "$SNAPSHOT_INFO" | jq -r --arg f "$NAME_FILTER" '
+    (.Snapshots // [])
+    | map(select(
+        ((.SnapshotId // "") | contains($f))
+        or ((.Description // "") | contains($f))
+        or (((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")) | contains($f))
+      ))
+    | .[]
+    | .SnapshotId
+  ')
+
+  if [[ -n "${MATCHED_SNAPSHOTS:-}" ]]; then
+    echo "Deleting matching snapshots..."
+    while IFS= read -r snapshot_id; do
+      [[ -z "$snapshot_id" ]] && continue
+      run_cmd "aws ${AWS_ARGS[*]} ec2 delete-snapshot --snapshot-id \"$snapshot_id\" >/dev/null || true"
+    done <<< "$MATCHED_SNAPSHOTS"
+  else
+    echo "No additional matching snapshots found."
+  fi
+
   echo
 }
 
 delete_ecr() {
-  echo "4) ECR cleanup"
+  echo "7) ECR cleanup"
 
   REPOS=$(aws "${AWS_ARGS[@]}" ecr describe-repositories \
     --query 'repositories[].repositoryName' \
@@ -420,7 +694,7 @@ delete_ecr() {
   local found=0
   if [[ -n "${REPOS:-}" ]]; then
     for repo in $REPOS; do
-      if [[ "$repo" == *"$NAME_FILTER"* ]]; then
+      if contains_filter "$repo"; then
         found=1
         run_cmd "aws ${AWS_ARGS[*]} ecr delete-repository --repository-name \"$repo\" --force || true"
       fi
@@ -435,7 +709,7 @@ delete_ecr() {
 }
 
 delete_log_groups() {
-  echo "5) CloudWatch log group cleanup"
+  echo "8) CloudWatch log group cleanup"
 
   LOG_GROUPS=$(aws "${AWS_ARGS[@]}" logs describe-log-groups \
     --query 'logGroups[].logGroupName' \
@@ -444,7 +718,7 @@ delete_log_groups() {
   local found=0
   if [[ -n "${LOG_GROUPS:-}" ]]; then
     for lg in $LOG_GROUPS; do
-      if [[ "$lg" == *"$NAME_FILTER"* ]]; then
+      if contains_filter "$lg"; then
         found=1
         run_cmd "aws ${AWS_ARGS[*]} logs delete-log-group --log-group-name \"$lg\" || true"
       fi
@@ -459,7 +733,7 @@ delete_log_groups() {
 }
 
 show_remaining() {
-  echo "6) Remaining matching resources"
+  echo "9) Remaining matching resources"
 
   echo "--- ECS services ---"
   aws "${AWS_ARGS[@]}" ecs list-services \
@@ -484,6 +758,111 @@ show_remaining() {
       | .TargetGroupName + "  " + .TargetGroupArn
     ' || true
 
+  echo "--- NAT gateways ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-nat-gateways \
+    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+      (.NatGateways // [])
+      | map(select(
+          ((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ") | contains($f))
+          or ((.NatGatewayId // "") | contains($f))
+      ))
+      | .[]
+      | .NatGatewayId
+    ' || true
+
+  echo "--- Unattached Elastic IPs matching filter ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-addresses \
+    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+      (.Addresses // [])
+      | map(select(
+          .AssociationId == null and
+          (
+            ((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ") | contains($f))
+            or ((.PublicIp // "") | contains($f))
+            or ((.AllocationId // "") | contains($f))
+          )
+      ))
+      | .[]
+      | .PublicIp + "  " + .AllocationId
+    ' || true
+
+  echo "--- Specific Elastic IP ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-addresses \
+    --public-ips "$SPECIFIC_EIP_IP" \
+    --query 'Addresses[].{PublicIp:PublicIp,AllocationId:AllocationId,AssociationId:AssociationId}' \
+    --output table 2>/dev/null || true
+
+  echo "--- WAF Web ACLs (matching filter, REGIONAL) ---"
+  aws "${AWS_ARGS[@]}" wafv2 list-web-acls --scope REGIONAL --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+    (.WebACLs // [])
+    | map(select((.Name // "") | contains($f)))
+    | .[]
+    | .Name + "  " + .ARN
+  ' || true
+
+  echo "--- WAF Web ACLs (matching filter, CLOUDFRONT/us-east-1) ---"
+  local cf_args=(--region us-east-1)
+  if [[ -n "$PROFILE" ]]; then
+    cf_args+=(--profile "$PROFILE")
+  fi
+  aws "${cf_args[@]}" wafv2 list-web-acls --scope CLOUDFRONT --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+    (.WebACLs // [])
+    | map(select((.Name // "") | contains($f)))
+    | .[]
+    | .Name + "  " + .ARN
+  ' || true
+
+  echo "--- KMS customer keys matching filter (not pending deletion) ---"
+  KEY_IDS=$(aws "${AWS_ARGS[@]}" kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null || true)
+  if [[ -n "${KEY_IDS:-}" ]]; then
+    for key_id in $KEY_IDS; do
+      KEY_INFO=$(aws "${AWS_ARGS[@]}" kms describe-key --key-id "$key_id" --output json 2>/dev/null || true)
+      [[ -z "${KEY_INFO:-}" ]] && continue
+
+      local manager state arn description aliases tags alias_blob tag_blob combined
+      manager=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyManager // empty')
+      state=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyState // empty')
+      arn=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Arn // empty')
+      description=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Description // empty')
+      [[ "$manager" != "CUSTOMER" || "$state" == "PendingDeletion" ]] && continue
+
+      aliases=$(aws "${AWS_ARGS[@]}" kms list-aliases --key-id "$key_id" --output json 2>/dev/null || true)
+      tags=$(aws "${AWS_ARGS[@]}" kms list-resource-tags --key-id "$key_id" --output json 2>/dev/null || true)
+      alias_blob=$(echo "${aliases:-{\"Aliases\":[]}}" | jq -r '(.Aliases // []) | map(.AliasName // "") | join(" ")')
+      tag_blob=$(echo "${tags:-{\"Tags\":[]}}" | jq -r '(.Tags // []) | map((.TagKey // "") + "=" + (.TagValue // "")) | join(" ")')
+      combined="$arn $description $alias_blob $tag_blob"
+
+      if contains_filter "$combined"; then
+        echo "$arn"
+      fi
+    done
+  fi
+
+  echo "--- AMIs matching filter ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-images --owners self --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+    (.Images // [])
+    | map(select(
+        ((.ImageId // "") | contains($f))
+        or ((.Name // "") | contains($f))
+        or ((.Description // "") | contains($f))
+        or (((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")) | contains($f))
+      ))
+    | .[]
+    | (.ImageId + "  " + (.Name // ""))
+  ' || true
+
+  echo "--- Snapshots matching filter ---"
+  aws "${AWS_ARGS[@]}" ec2 describe-snapshots --owner-ids self --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
+    (.Snapshots // [])
+    | map(select(
+        ((.SnapshotId // "") | contains($f))
+        or ((.Description // "") | contains($f))
+        or (((.Tags // []) | map((.Key // "") + "=" + (.Value // "")) | join(" ")) | contains($f))
+      ))
+    | .[]
+    | (.SnapshotId + "  " + (.Description // ""))
+  ' || true
+
   echo "--- ECR repositories ---"
   aws "${AWS_ARGS[@]}" ecr describe-repositories \
     --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
@@ -501,39 +880,14 @@ show_remaining() {
       | .[]
       | .logGroupName
     ' || true
-
-  echo "--- NAT gateways ---"
-  aws "${AWS_ARGS[@]}" ec2 describe-nat-gateways \
-    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
-      (.NatGateways // [])
-      | map(select(
-          ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
-          or ((.NatGatewayId // "") | contains($f))
-      ))
-      | .[]
-      | .NatGatewayId
-    ' || true
-
-  echo "--- Unattached Elastic IPs ---"
-  aws "${AWS_ARGS[@]}" ec2 describe-addresses \
-    --output json 2>/dev/null | jq -r --arg f "$NAME_FILTER" '
-      (.Addresses // [])
-      | map(select(
-          .AssociationId == null and
-          (
-            ((.Tags // []) | map(.Value // "") | join(" ") | contains($f))
-            or ((.PublicIp // "") | contains($f))
-            or ((.AllocationId // "") | contains($f))
-          )
-      ))
-      | .[]
-      | .PublicIp + "  " + .AllocationId
-    ' || true
 }
 
 [[ "$DELETE_ECS" -eq 1 ]] && delete_ecs
 [[ "$DELETE_LOAD_BALANCERS" -eq 1 ]] && delete_load_balancers
 [[ "$DELETE_NETWORK" -eq 1 ]] && delete_network
+[[ "$DELETE_WAF" -eq 1 ]] && delete_waf
+[[ "$DELETE_KMS" -eq 1 ]] && delete_kms
+[[ "$DELETE_STORAGE" -eq 1 ]] && delete_storage
 [[ "$DELETE_ECR" -eq 1 ]] && delete_ecr
 [[ "$DELETE_LOG_GROUPS" -eq 1 ]] && delete_log_groups
 
