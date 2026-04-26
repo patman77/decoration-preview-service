@@ -67,6 +67,11 @@ Options:
 
   --delete-kms
       Also schedule deletion for matching customer-managed KMS keys.
+      A KMS audit report runs automatically before any deletion.
+
+  --audit-kms, --report-kms
+      Run KMS audit/report mode only (no deletion). Lists customer-managed keys,
+      usage across EBS/S3/RDS resources, and keys that appear safe to delete.
 
   --delete-storage
       Also deregister matching AMIs and delete matching EBS snapshots.
@@ -116,6 +121,7 @@ DELETE_ECS=0
 DELETE_WAF=0
 DELETE_KMS=0
 DELETE_STORAGE=0
+AUDIT_KMS=0
 FORCE=0
 
 while [[ $# -gt 0 ]]; do
@@ -184,6 +190,10 @@ while [[ $# -gt 0 ]]; do
       DELETE_KMS=1
       shift
       ;;
+    --audit-kms|--report-kms)
+      AUDIT_KMS=1
+      shift
+      ;;
     --delete-storage)
       DELETE_STORAGE=1
       shift
@@ -243,6 +253,17 @@ run_cmd() {
   fi
 }
 
+declare -a KMS_AUDIT_KEY_IDS=()
+declare -A KMS_AUDIT_KEY_ARN=()
+declare -A KMS_AUDIT_KEY_STATE=()
+declare -A KMS_AUDIT_KEY_CREATED=()
+declare -A KMS_AUDIT_KEY_DESCRIPTION=()
+declare -A KMS_AUDIT_KEY_ALIASES=()
+declare -A KMS_AUDIT_KEY_USAGE=()
+declare -A KMS_AUDIT_KEY_SAFE_TO_DELETE=()
+declare -A KMS_AUDIT_KEY_MATCHES_FILTER=()
+KMS_AUDIT_BUILT=0
+
 echo "=== Targeted AWS cleanup started ==="
 echo "Region:                 $REGION"
 echo "Cluster:                $CLUSTER"
@@ -255,18 +276,24 @@ echo "Delete network:         $DELETE_NETWORK"
 echo "Delete WAF:             $DELETE_WAF"
 echo "Delete KMS:             $DELETE_KMS"
 echo "Delete storage:         $DELETE_STORAGE"
+echo "Audit/report KMS only:  $AUDIT_KMS"
 echo "Delete ECR:             $DELETE_ECR"
 echo "Delete log groups:      $DELETE_LOG_GROUPS"
 echo "Dry run:                $DRY_RUN"
 echo
 
-if [[ "$DELETE_ECS" -eq 0 && "$DELETE_LOAD_BALANCERS" -eq 0 && "$DELETE_NETWORK" -eq 0 && "$DELETE_WAF" -eq 0 && "$DELETE_KMS" -eq 0 && "$DELETE_STORAGE" -eq 0 && "$DELETE_ECR" -eq 0 && "$DELETE_LOG_GROUPS" -eq 0 ]]; then
-  echo "Nothing selected for deletion."
-  echo "Use one of: --delete-ecs, --delete-load-balancers, --delete-network, --delete-waf, --delete-kms, --delete-storage, --delete-ecr, --delete-log-groups, or --delete-all"
+HAS_DELETE_ACTION=0
+if [[ "$DELETE_ECS" -eq 1 || "$DELETE_LOAD_BALANCERS" -eq 1 || "$DELETE_NETWORK" -eq 1 || "$DELETE_WAF" -eq 1 || "$DELETE_KMS" -eq 1 || "$DELETE_STORAGE" -eq 1 || "$DELETE_ECR" -eq 1 || "$DELETE_LOG_GROUPS" -eq 1 ]]; then
+  HAS_DELETE_ACTION=1
+fi
+
+if [[ "$HAS_DELETE_ACTION" -eq 0 && "$AUDIT_KMS" -eq 0 ]]; then
+  echo "Nothing selected."
+  echo "Use one of: --audit-kms/--report-kms, --delete-ecs, --delete-load-balancers, --delete-network, --delete-waf, --delete-kms, --delete-storage, --delete-ecr, --delete-log-groups, or --delete-all"
   exit 1
 fi
 
-if [[ "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
+if [[ "$HAS_DELETE_ACTION" -eq 1 && "$FORCE" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
   read -r -p "Proceed with deletion of resources matching '$NAME_FILTER' in region '$REGION'? [y/N] " REPLY
   case "$REPLY" in
     y|Y|yes|YES) ;;
@@ -561,52 +588,283 @@ delete_waf() {
   echo
 }
 
-delete_kms() {
-  echo "5) KMS cleanup (customer-managed keys)"
+kms_normalize_identifier() {
+  local raw="${1:-}"
+  echo "${raw,,}"
+}
 
-  KEY_IDS=$(aws "${AWS_ARGS[@]}" kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null || true)
-  local matched=0
+kms_identifier_matches_key() {
+  local key_id="${1:-}"
+  local key_arn="${2:-}"
+  local aliases_blob="${3:-}"
+  local candidate="${4:-}"
 
-  if [[ -n "${KEY_IDS:-}" ]]; then
-    for key_id in $KEY_IDS; do
-      KEY_INFO=$(aws "${AWS_ARGS[@]}" kms describe-key --key-id "$key_id" --output json 2>/dev/null || true)
-      [[ -z "${KEY_INFO:-}" ]] && continue
+  [[ -z "$candidate" ]] && return 1
 
-      local manager state arn description
-      manager=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyManager // empty')
-      state=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.KeyState // empty')
-      arn=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Arn // empty')
-      description=$(echo "$KEY_INFO" | jq -r '.KeyMetadata.Description // empty')
+  local c_norm key_id_norm key_arn_norm
+  c_norm=$(kms_normalize_identifier "$candidate")
+  key_id_norm=$(kms_normalize_identifier "$key_id")
+  key_arn_norm=$(kms_normalize_identifier "$key_arn")
 
-      if [[ "$manager" != "CUSTOMER" ]]; then
-        continue
-      fi
-
-      if [[ "$state" == "PendingDeletion" ]]; then
-        continue
-      fi
-
-      local aliases tags alias_blob tag_blob match_text
-      aliases=$(aws "${AWS_ARGS[@]}" kms list-aliases --key-id "$key_id" --output json 2>/dev/null || true)
-      tags=$(aws "${AWS_ARGS[@]}" kms list-resource-tags --key-id "$key_id" --output json 2>/dev/null || true)
-
-      alias_blob=$(echo "${aliases:-{\"Aliases\":[]}}" | jq -r '(.Aliases // []) | map(.AliasName // "") | join(" ")')
-      tag_blob=$(echo "${tags:-{\"Tags\":[]}}" | jq -r '(.Tags // []) | map((.TagKey // "") + "=" + (.TagValue // "")) | join(" ")')
-      match_text="$arn $description $alias_blob $tag_blob"
-
-      if ! contains_filter "$match_text"; then
-        continue
-      fi
-
-      matched=1
-      echo "Matched KMS key: ${arn:-$key_id}"
-      run_cmd "aws ${AWS_ARGS[*]} kms disable-key --key-id \"$key_id\" >/dev/null 2>&1 || true"
-      run_cmd "aws ${AWS_ARGS[*]} kms schedule-key-deletion --key-id \"$key_id\" --pending-window-in-days 7 >/dev/null || true"
-    done
+  if [[ "$c_norm" == "$key_id_norm" || "$c_norm" == "$key_arn_norm" ]]; then
+    return 0
   fi
 
+  local arn_prefix alias alias_norm alias_arn_norm
+  arn_prefix="${key_arn%:key/*}"
+
+  for alias in $aliases_blob; do
+    alias_norm=$(kms_normalize_identifier "$alias")
+    alias_arn_norm=$(kms_normalize_identifier "${arn_prefix}:$alias")
+    if [[ "$c_norm" == "$alias_norm" || "$c_norm" == "$alias_arn_norm" ]]; then
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+build_kms_audit_data() {
+  if [[ "$KMS_AUDIT_BUILT" -eq 1 ]]; then
+    return
+  fi
+
+  KMS_AUDIT_KEY_IDS=()
+
+  local key_ids
+  key_ids=$(aws "${AWS_ARGS[@]}" kms list-keys --query 'Keys[].KeyId' --output text 2>/dev/null || true)
+
+  if [[ -z "${key_ids:-}" ]]; then
+    KMS_AUDIT_BUILT=1
+    return
+  fi
+
+  local volumes_json snapshots_json db_instances_json db_clusters_json bucket_names
+  volumes_json=$(aws "${AWS_ARGS[@]}" ec2 describe-volumes --output json 2>/dev/null || true)
+  snapshots_json=$(aws "${AWS_ARGS[@]}" ec2 describe-snapshots --owner-ids self --output json 2>/dev/null || true)
+  db_instances_json=$(aws "${AWS_ARGS[@]}" rds describe-db-instances --output json 2>/dev/null || true)
+  db_clusters_json=$(aws "${AWS_ARGS[@]}" rds describe-db-clusters --output json 2>/dev/null || true)
+  bucket_names=$(aws "${AWS_ARGS[@]}" s3api list-buckets --query 'Buckets[].Name' --output text 2>/dev/null || true)
+
+  local key_id key_info manager state arn created description aliases_json tags_json alias_blob tag_blob combined
+  for key_id in $key_ids; do
+    key_info=$(aws "${AWS_ARGS[@]}" kms describe-key --key-id "$key_id" --output json 2>/dev/null || true)
+    [[ -z "${key_info:-}" ]] && continue
+
+    manager=$(echo "$key_info" | jq -r '.KeyMetadata.KeyManager // empty')
+    [[ "$manager" != "CUSTOMER" ]] && continue
+
+    state=$(echo "$key_info" | jq -r '.KeyMetadata.KeyState // "unknown"')
+    arn=$(echo "$key_info" | jq -r '.KeyMetadata.Arn // empty')
+    created=$(echo "$key_info" | jq -r '.KeyMetadata.CreationDate // "unknown"')
+    description=$(echo "$key_info" | jq -r '.KeyMetadata.Description // ""')
+
+    aliases_json=$(aws "${AWS_ARGS[@]}" kms list-aliases --key-id "$key_id" --output json 2>/dev/null || true)
+    tags_json=$(aws "${AWS_ARGS[@]}" kms list-resource-tags --key-id "$key_id" --output json 2>/dev/null || true)
+    alias_blob=$(echo "${aliases_json:-{\"Aliases\":[]}}" | jq -r '(.Aliases // []) | map(.AliasName // "") | map(select(length > 0)) | join(" ")')
+    tag_blob=$(echo "${tags_json:-{\"Tags\":[]}}" | jq -r '(.Tags // []) | map((.TagKey // "") + "=" + (.TagValue // "")) | join(" ")')
+
+    local usage_lines=()
+    local vol_hits=()
+    local snap_hits=()
+    local rds_hits=()
+    local rds_cluster_hits=()
+    local s3_hits=()
+
+    while IFS=$'        ' read -r kms_id volume_id volume_state; do
+      [[ -z "${volume_id:-}" ]] && continue
+      if kms_identifier_matches_key "$key_id" "$arn" "$alias_blob" "$kms_id"; then
+        vol_hits+=("${volume_id}(${volume_state:-unknown})")
+      fi
+    done < <(echo "${volumes_json:-{\"Volumes\":[]}}" | jq -r '.Volumes[]? | select(.Encrypted == true) | [(.KmsKeyId // ""), (.VolumeId // ""), (.State // "")] | @tsv')
+
+    while IFS=$'        ' read -r kms_id snapshot_id snapshot_state; do
+      [[ -z "${snapshot_id:-}" ]] && continue
+      if kms_identifier_matches_key "$key_id" "$arn" "$alias_blob" "$kms_id"; then
+        snap_hits+=("${snapshot_id}(${snapshot_state:-unknown})")
+      fi
+    done < <(echo "${snapshots_json:-{\"Snapshots\":[]}}" | jq -r '.Snapshots[]? | select(.Encrypted == true) | [(.KmsKeyId // ""), (.SnapshotId // ""), (.State // "")] | @tsv')
+
+    while IFS=$'        ' read -r kms_id db_id db_state; do
+      [[ -z "${db_id:-}" ]] && continue
+      if kms_identifier_matches_key "$key_id" "$arn" "$alias_blob" "$kms_id"; then
+        rds_hits+=("${db_id}(${db_state:-unknown})")
+      fi
+    done < <(echo "${db_instances_json:-{\"DBInstances\":[]}}" | jq -r '.DBInstances[]? | [(.KmsKeyId // ""), (.DBInstanceIdentifier // ""), (.DBInstanceStatus // "")] | @tsv')
+
+    while IFS=$'        ' read -r kms_id cluster_id cluster_state; do
+      [[ -z "${cluster_id:-}" ]] && continue
+      if kms_identifier_matches_key "$key_id" "$arn" "$alias_blob" "$kms_id"; then
+        rds_cluster_hits+=("${cluster_id}(${cluster_state:-unknown})")
+      fi
+    done < <(echo "${db_clusters_json:-{\"DBClusters\":[]}}" | jq -r '.DBClusters[]? | [(.KmsKeyId // ""), (.DBClusterIdentifier // ""), (.Status // "")] | @tsv')
+
+    if [[ -n "${bucket_names:-}" ]]; then
+      local bucket enc_json bucket_kms_id
+      for bucket in $bucket_names; do
+        enc_json=$(aws "${AWS_ARGS[@]}" s3api get-bucket-encryption --bucket "$bucket" --output json 2>/dev/null || true)
+        [[ -z "${enc_json:-}" ]] && continue
+        while IFS= read -r bucket_kms_id; do
+          [[ -z "${bucket_kms_id:-}" ]] && continue
+          if kms_identifier_matches_key "$key_id" "$arn" "$alias_blob" "$bucket_kms_id"; then
+            s3_hits+=("$bucket")
+            break
+          fi
+        done < <(echo "$enc_json" | jq -r '.ServerSideEncryptionConfiguration.Rules[]?.ApplyServerSideEncryptionByDefault.KMSMasterKeyID // empty')
+      done
+    fi
+
+    if [[ ${#vol_hits[@]} -gt 0 ]]; then
+      usage_lines+=("EBS volumes: ${vol_hits[*]}")
+    fi
+    if [[ ${#snap_hits[@]} -gt 0 ]]; then
+      usage_lines+=("EBS snapshots: ${snap_hits[*]}")
+    fi
+    if [[ ${#s3_hits[@]} -gt 0 ]]; then
+      usage_lines+=("S3 buckets: ${s3_hits[*]}")
+    fi
+    if [[ ${#rds_hits[@]} -gt 0 ]]; then
+      usage_lines+=("RDS instances: ${rds_hits[*]}")
+    fi
+    if [[ ${#rds_cluster_hits[@]} -gt 0 ]]; then
+      usage_lines+=("RDS clusters: ${rds_cluster_hits[*]}")
+    fi
+
+    local safe_to_delete=0
+    if [[ ${#usage_lines[@]} -eq 0 && "$state" != "PendingDeletion" ]]; then
+      safe_to_delete=1
+    fi
+
+    combined="$arn $description $alias_blob $tag_blob"
+
+    KMS_AUDIT_KEY_IDS+=("$key_id")
+    KMS_AUDIT_KEY_ARN["$key_id"]="$arn"
+    KMS_AUDIT_KEY_STATE["$key_id"]="$state"
+    KMS_AUDIT_KEY_CREATED["$key_id"]="$created"
+    KMS_AUDIT_KEY_DESCRIPTION["$key_id"]="$description"
+    KMS_AUDIT_KEY_ALIASES["$key_id"]="$alias_blob"
+    KMS_AUDIT_KEY_USAGE["$key_id"]="$(printf '%s; ' "${usage_lines[@]}")"
+    KMS_AUDIT_KEY_SAFE_TO_DELETE["$key_id"]="$safe_to_delete"
+
+    if contains_filter "$combined"; then
+      KMS_AUDIT_KEY_MATCHES_FILTER["$key_id"]=1
+    else
+      KMS_AUDIT_KEY_MATCHES_FILTER["$key_id"]=0
+    fi
+  done
+
+  KMS_AUDIT_BUILT=1
+}
+
+print_kms_audit_report() {
+  build_kms_audit_data
+
+  echo "5) KMS audit report (customer-managed keys)"
+
+  if [[ ${#KMS_AUDIT_KEY_IDS[@]} -eq 0 ]]; then
+    echo "No customer-managed KMS keys found in region ${REGION}."
+    echo
+    return
+  fi
+
+  local total=0 safe_count=0 in_use_count=0
+  for key_id in "${KMS_AUDIT_KEY_IDS[@]}"; do
+    total=$((total + 1))
+
+    local arn state created description aliases usage safe matches_filter
+    arn="${KMS_AUDIT_KEY_ARN[$key_id]}"
+    state="${KMS_AUDIT_KEY_STATE[$key_id]}"
+    created="${KMS_AUDIT_KEY_CREATED[$key_id]}"
+    description="${KMS_AUDIT_KEY_DESCRIPTION[$key_id]}"
+    aliases="${KMS_AUDIT_KEY_ALIASES[$key_id]}"
+    usage="${KMS_AUDIT_KEY_USAGE[$key_id]}"
+    safe="${KMS_AUDIT_KEY_SAFE_TO_DELETE[$key_id]}"
+    matches_filter="${KMS_AUDIT_KEY_MATCHES_FILTER[$key_id]}"
+
+    if [[ "$safe" -eq 1 ]]; then
+      safe_count=$((safe_count + 1))
+    else
+      in_use_count=$((in_use_count + 1))
+    fi
+
+    echo "- Key: ${arn:-$key_id}"
+    echo "  KeyId:        $key_id"
+    echo "  Status:       $state"
+    echo "  Created:      $created"
+    echo "  Description:  ${description:-<none>}"
+    echo "  Aliases:      ${aliases:-<none>}"
+    echo "  Filter match: $matches_filter"
+
+    if [[ -n "${usage// }" ]]; then
+      echo "  Usage:"
+      local usage_line
+      IFS=';' read -ra usage_parts <<< "$usage"
+      for usage_line in "${usage_parts[@]}"; do
+        usage_line="${usage_line# }"
+        usage_line="${usage_line% }"
+        [[ -z "$usage_line" ]] && continue
+        echo "    - $usage_line"
+      done
+      echo "  Safe to delete: NO (resource usage detected)"
+    elif [[ "$state" == "PendingDeletion" ]]; then
+      echo "  Usage:         none detected in audited services"
+      echo "  Safe to delete: NO (already pending deletion)"
+    else
+      echo "  Usage:         none detected in audited services"
+      echo "  Safe to delete: YES (based on audited services)"
+    fi
+    echo
+  done
+
+  echo "KMS audit summary:"
+  echo "  Total customer-managed keys: $total"
+  echo "  Safe to delete candidates:   $safe_count"
+  echo "  Not safe / in use:           $in_use_count"
+  echo
+}
+
+delete_kms() {
+  echo "6) KMS cleanup (customer-managed keys)"
+
+  build_kms_audit_data
+
+  local matched=0 scheduled=0 skipped_in_use=0
+
+  for key_id in "${KMS_AUDIT_KEY_IDS[@]}"; do
+    local arn state usage safe matches_filter
+    arn="${KMS_AUDIT_KEY_ARN[$key_id]}"
+    state="${KMS_AUDIT_KEY_STATE[$key_id]}"
+    usage="${KMS_AUDIT_KEY_USAGE[$key_id]}"
+    safe="${KMS_AUDIT_KEY_SAFE_TO_DELETE[$key_id]}"
+    matches_filter="${KMS_AUDIT_KEY_MATCHES_FILTER[$key_id]}"
+
+    [[ "$matches_filter" -eq 1 ]] || continue
+    matched=1
+
+    if [[ "$state" == "PendingDeletion" ]]; then
+      echo "Skipping ${arn:-$key_id}: already pending deletion."
+      continue
+    fi
+
+    if [[ "$safe" -ne 1 ]]; then
+      skipped_in_use=$((skipped_in_use + 1))
+      echo "Skipping ${arn:-$key_id}: key appears in use."
+      if [[ -n "${usage// }" ]]; then
+        echo "  Usage summary: $usage"
+      fi
+      continue
+    fi
+
+    echo "Scheduling deletion for ${arn:-$key_id} (safe candidate, 7-day window)"
+    run_cmd "aws ${AWS_ARGS[*]} kms disable-key --key-id \"$key_id\" >/dev/null 2>&1 || true"
+    run_cmd "aws ${AWS_ARGS[*]} kms schedule-key-deletion --key-id \"$key_id\" --pending-window-in-days 7 >/dev/null || true"
+    scheduled=$((scheduled + 1))
+  done
+
   if [[ "$matched" -eq 0 ]]; then
-    echo "No matching customer-managed KMS keys found."
+    echo "No matching customer-managed KMS keys found for filter '$NAME_FILTER'."
+  else
+    echo "KMS deletion summary: scheduled=$scheduled, skipped_in_use_or_not_safe=$skipped_in_use"
   fi
 
   echo
@@ -881,6 +1139,17 @@ show_remaining() {
       | .logGroupName
     ' || true
 }
+
+if [[ "$HAS_DELETE_ACTION" -eq 1 || "$AUDIT_KMS" -eq 1 ]]; then
+  print_kms_audit_report
+fi
+
+if [[ "$HAS_DELETE_ACTION" -eq 0 && "$AUDIT_KMS" -eq 1 ]]; then
+  echo "Audit-only mode selected; no deletion actions were run."
+  echo
+  echo "=== Targeted cleanup finished ==="
+  exit 0
+fi
 
 [[ "$DELETE_ECS" -eq 1 ]] && delete_ecs
 [[ "$DELETE_LOAD_BALANCERS" -eq 1 ]] && delete_load_balancers
