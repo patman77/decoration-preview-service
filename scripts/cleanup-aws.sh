@@ -118,8 +118,17 @@ delete_waf_web_acls() {
       --region "$waf_region" \
       --output json 2>/dev/null || true)
 
+    if [[ -z "${web_acls_json:-}" ]]; then
+      web_acls_json='{"WebACLs":[]}'
+    fi
+
+    if ! echo "$web_acls_json" | jq -e . >/dev/null 2>&1; then
+      echo "Warning: invalid JSON returned by list-web-acls for scope ${scope}; skipping this scope."
+      continue
+    fi
+
     local acl_count
-    acl_count=$(echo "${web_acls_json:-{\"WebACLs\":[]}}" | jq '.WebACLs | length')
+    acl_count=$(echo "$web_acls_json" | jq -r '(.WebACLs // []) | length')
 
     if [[ "$acl_count" -eq 0 ]]; then
       echo "No WAF Web ACLs found for scope ${scope}."
@@ -130,9 +139,14 @@ delete_waf_web_acls() {
       [[ -z "$acl" ]] && continue
 
       local acl_name acl_id acl_arn
-      acl_name=$(echo "$acl" | jq -r '.Name')
-      acl_id=$(echo "$acl" | jq -r '.Id')
-      acl_arn=$(echo "$acl" | jq -r '.ARN')
+      acl_name=$(echo "$acl" | jq -r '.Name // empty')
+      acl_id=$(echo "$acl" | jq -r '.Id // empty')
+      acl_arn=$(echo "$acl" | jq -r '.ARN // empty')
+
+      if [[ -z "$acl_name" || -z "$acl_id" || -z "$acl_arn" ]]; then
+        echo "Skipping malformed WAF ACL entry: $acl"
+        continue
+      fi
 
       echo "Found Web ACL ${acl_name} (${acl_arn})"
 
@@ -145,8 +159,9 @@ delete_waf_web_acls() {
           --query 'ResourceArns[]' \
           --output text 2>/dev/null || true)
 
-        if [[ -n "${resources:-}" ]]; then
+        if [[ -n "${resources:-}" && "$resources" != "None" ]]; then
           for resource_arn in $resources; do
+            [[ "$resource_arn" == "None" ]] && continue
             echo "Disassociating Web ACL ${acl_name} from ${resource_arn}"
             aws wafv2 disassociate-web-acl \
               --resource-arn "$resource_arn" \
@@ -176,7 +191,7 @@ delete_waf_web_acls() {
         --scope "$scope" \
         --lock-token "$lock_token" \
         --region "$waf_region" >/dev/null || true
-    done < <(echo "$web_acls_json" | jq -c '.WebACLs[]?')
+    done < <(echo "$web_acls_json" | jq -c '(.WebACLs // [])[]?')
   done
 }
 
