@@ -3,8 +3,19 @@ set -euo pipefail
 
 REGION="eu-central-1"
 CLUSTER="decoration-preview-cluster"
+SPECIFIC_EIP_IP="52.58.157.195"
 
-echo "=== AWS cleanup started for region: $REGION ==="
+require_tools() {
+  if ! command -v aws >/dev/null 2>&1; then
+    echo "Error: aws CLI not found in PATH." >&2
+    exit 1
+  fi
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "Error: jq not found in PATH." >&2
+    exit 1
+  fi
+}
 
 delete_nat_gateways() {
   echo "Deleting NAT gateways (major hourly cost source)..."
@@ -26,7 +37,41 @@ delete_nat_gateways() {
   fi
 }
 
-release_elastic_ips() {
+release_specific_elastic_ip() {
+  echo "Checking for specific Elastic IP ${SPECIFIC_EIP_IP}..."
+
+  local eip_json
+  eip_json=$(aws ec2 describe-addresses \
+    --region "$REGION" \
+    --public-ips "$SPECIFIC_EIP_IP" \
+    --output json 2>/dev/null || true)
+
+  if [[ -z "${eip_json:-}" || "$(echo "$eip_json" | jq '.Addresses | length')" -eq 0 ]]; then
+    echo "Specific Elastic IP ${SPECIFIC_EIP_IP} not found in region ${REGION}."
+    return
+  fi
+
+  local allocation_id association_id
+  allocation_id=$(echo "$eip_json" | jq -r '.Addresses[0].AllocationId // empty')
+  association_id=$(echo "$eip_json" | jq -r '.Addresses[0].AssociationId // empty')
+
+  if [[ -z "$allocation_id" ]]; then
+    echo "Could not resolve allocation id for ${SPECIFIC_EIP_IP}; skipping."
+    return
+  fi
+
+  if [[ -n "$association_id" ]]; then
+    echo "Elastic IP ${SPECIFIC_EIP_IP} is still attached (association ${association_id}); skipping forced release."
+    return
+  fi
+
+  echo "Releasing specific unattached Elastic IP ${SPECIFIC_EIP_IP} (${allocation_id})"
+  aws ec2 release-address \
+    --region "$REGION" \
+    --allocation-id "$allocation_id" >/dev/null || true
+}
+
+release_unattached_elastic_ips() {
   echo "Releasing unattached Elastic IPs..."
   EIP_ALLOCS=$(aws ec2 describe-addresses \
     --region "$REGION" \
@@ -44,6 +89,217 @@ release_elastic_ips() {
     echo "No unattached Elastic IPs found."
   fi
 }
+
+delete_waf_web_acls() {
+  echo "Deleting WAFv2 Web ACLs and their associations/rules..."
+
+  local scopes=("REGIONAL" "CLOUDFRONT")
+  local resource_types=(
+    "APPLICATION_LOAD_BALANCER"
+    "API_GATEWAY"
+    "APPSYNC"
+    "COGNITO_USER_POOL"
+    "APP_RUNNER_SERVICE"
+    "VERIFIED_ACCESS_INSTANCE"
+    "AMPLIFY"
+  )
+
+  for scope in "${scopes[@]}"; do
+    local waf_region="$REGION"
+    if [[ "$scope" == "CLOUDFRONT" ]]; then
+      waf_region="us-east-1"
+    fi
+
+    echo "Processing WAF scope=${scope} region=${waf_region}"
+
+    local web_acls_json
+    web_acls_json=$(aws wafv2 list-web-acls \
+      --scope "$scope" \
+      --region "$waf_region" \
+      --output json 2>/dev/null || true)
+
+    if [[ -z "${web_acls_json:-}" ]]; then
+      web_acls_json='{"WebACLs":[]}'
+    fi
+
+    if ! echo "$web_acls_json" | jq -e . >/dev/null 2>&1; then
+      echo "Warning: invalid JSON returned by list-web-acls for scope ${scope}; skipping this scope."
+      continue
+    fi
+
+    local acl_count
+    acl_count=$(echo "$web_acls_json" | jq -r '(.WebACLs // []) | length')
+
+    if [[ "$acl_count" -eq 0 ]]; then
+      echo "No WAF Web ACLs found for scope ${scope}."
+      continue
+    fi
+
+    while IFS= read -r acl; do
+      [[ -z "$acl" ]] && continue
+
+      local acl_name acl_id acl_arn
+      acl_name=$(echo "$acl" | jq -r '.Name // empty')
+      acl_id=$(echo "$acl" | jq -r '.Id // empty')
+      acl_arn=$(echo "$acl" | jq -r '.ARN // empty')
+
+      if [[ -z "$acl_name" || -z "$acl_id" || -z "$acl_arn" ]]; then
+        echo "Skipping malformed WAF ACL entry: $acl"
+        continue
+      fi
+
+      echo "Found Web ACL ${acl_name} (${acl_arn})"
+
+      for rt in "${resource_types[@]}"; do
+        local resources
+        resources=$(aws wafv2 list-resources-for-web-acl \
+          --web-acl-arn "$acl_arn" \
+          --resource-type "$rt" \
+          --region "$waf_region" \
+          --query 'ResourceArns[]' \
+          --output text 2>/dev/null || true)
+
+        if [[ -n "${resources:-}" && "$resources" != "None" ]]; then
+          for resource_arn in $resources; do
+            [[ "$resource_arn" == "None" ]] && continue
+            echo "Disassociating Web ACL ${acl_name} from ${resource_arn}"
+            aws wafv2 disassociate-web-acl \
+              --resource-arn "$resource_arn" \
+              --region "$waf_region" >/dev/null || true
+          done
+        fi
+      done
+
+      local lock_token
+      lock_token=$(aws wafv2 get-web-acl \
+        --name "$acl_name" \
+        --id "$acl_id" \
+        --scope "$scope" \
+        --region "$waf_region" \
+        --query 'LockToken' \
+        --output text 2>/dev/null || true)
+
+      if [[ -z "${lock_token:-}" || "$lock_token" == "None" ]]; then
+        echo "Unable to get lock token for Web ACL ${acl_name}; skipping delete."
+        continue
+      fi
+
+      echo "Deleting Web ACL ${acl_name}"
+      aws wafv2 delete-web-acl \
+        --name "$acl_name" \
+        --id "$acl_id" \
+        --scope "$scope" \
+        --lock-token "$lock_token" \
+        --region "$waf_region" >/dev/null || true
+    done < <(echo "$web_acls_json" | jq -c '(.WebACLs // [])[]?')
+  done
+}
+
+delete_unused_kms_keys() {
+  echo "Scheduling deletion for customer-managed KMS keys..."
+
+  local key_ids
+  key_ids=$(aws kms list-keys \
+    --region "$REGION" \
+    --query 'Keys[].KeyId' \
+    --output text 2>/dev/null || true)
+
+  if [[ -z "${key_ids:-}" ]]; then
+    echo "No KMS keys returned."
+    return
+  fi
+
+  for key_id in $key_ids; do
+    local key_metadata_json
+    key_metadata_json=$(aws kms describe-key \
+      --region "$REGION" \
+      --key-id "$key_id" \
+      --output json 2>/dev/null || true)
+
+    [[ -z "${key_metadata_json:-}" ]] && continue
+
+    local manager state arn
+    manager=$(echo "$key_metadata_json" | jq -r '.KeyMetadata.KeyManager // empty')
+    state=$(echo "$key_metadata_json" | jq -r '.KeyMetadata.KeyState // empty')
+    arn=$(echo "$key_metadata_json" | jq -r '.KeyMetadata.Arn // empty')
+
+    if [[ "$manager" != "CUSTOMER" ]]; then
+      echo "Skipping AWS-managed key ${key_id}"
+      continue
+    fi
+
+    if [[ "$state" == "PendingDeletion" ]]; then
+      echo "Key already pending deletion: ${arn:-$key_id}"
+      continue
+    fi
+
+    echo "Disabling key ${arn:-$key_id} (state=${state})"
+    aws kms disable-key \
+      --region "$REGION" \
+      --key-id "$key_id" >/dev/null 2>&1 || true
+
+    echo "Scheduling deletion for ${arn:-$key_id} (7 days)"
+    aws kms schedule-key-deletion \
+      --region "$REGION" \
+      --key-id "$key_id" \
+      --pending-window-in-days 7 >/dev/null || true
+  done
+}
+
+delete_amis_and_snapshots() {
+  echo "Deregistering self-owned AMIs and deleting snapshots..."
+
+  local images_json
+  images_json=$(aws ec2 describe-images \
+    --region "$REGION" \
+    --owners self \
+    --output json 2>/dev/null || true)
+
+  local image_count
+  image_count=$(echo "${images_json:-{\"Images\":[]}}" | jq '.Images | length')
+
+  if [[ "$image_count" -gt 0 ]]; then
+    while IFS= read -r image_id; do
+      [[ -z "$image_id" ]] && continue
+      echo "Deregistering AMI ${image_id}"
+      aws ec2 deregister-image \
+        --region "$REGION" \
+        --image-id "$image_id" >/dev/null || true
+    done < <(echo "$images_json" | jq -r '.Images[]?.ImageId')
+
+    while IFS= read -r snap_id; do
+      [[ -z "$snap_id" ]] && continue
+      echo "Deleting AMI-linked snapshot ${snap_id}"
+      aws ec2 delete-snapshot \
+        --region "$REGION" \
+        --snapshot-id "$snap_id" >/dev/null || true
+    done < <(echo "$images_json" | jq -r '.Images[]?.BlockDeviceMappings[]?.Ebs?.SnapshotId // empty' | sort -u)
+  else
+    echo "No self-owned AMIs found."
+  fi
+
+  local snapshots
+  snapshots=$(aws ec2 describe-snapshots \
+    --region "$REGION" \
+    --owner-ids self \
+    --query 'Snapshots[].SnapshotId' \
+    --output text 2>/dev/null || true)
+
+  if [[ -n "${snapshots:-}" ]]; then
+    for snapshot_id in $snapshots; do
+      echo "Deleting snapshot ${snapshot_id}"
+      aws ec2 delete-snapshot \
+        --region "$REGION" \
+        --snapshot-id "$snapshot_id" >/dev/null || true
+    done
+  else
+    echo "No remaining self-owned snapshots found."
+  fi
+}
+
+require_tools
+
+echo "=== AWS cleanup started for region: $REGION ==="
 
 echo
 echo "1) List ECS services"
@@ -194,11 +450,27 @@ else
 fi
 
 echo
-echo "10) Release unattached Elastic IPs"
-release_elastic_ips
+echo "10) Delete WAF Web ACLs and associated rules"
+delete_waf_web_acls
 
 echo
-echo "11) Optional: list remaining cost-relevant resources"
+echo "11) Release specific Elastic IP ($SPECIFIC_EIP_IP) if unattached"
+release_specific_elastic_ip
+
+echo
+echo "12) Release unattached Elastic IPs"
+release_unattached_elastic_ips
+
+echo
+echo "13) Delete unused customer-managed KMS keys"
+delete_unused_kms_keys
+
+echo
+echo "14) Deregister AMIs and delete EBS snapshots"
+delete_amis_and_snapshots
+
+echo
+echo "15) Optional: list remaining cost-relevant resources"
 echo "--- ECS clusters ---"
 aws ecs list-clusters --region "$REGION" || true
 
@@ -216,6 +488,21 @@ aws ec2 describe-nat-gateways --region "$REGION" --output text || true
 
 echo "--- Elastic IPs ---"
 aws ec2 describe-addresses --region "$REGION" --output text || true
+
+echo "--- WAF Web ACLs (REGIONAL) ---"
+aws wafv2 list-web-acls --scope REGIONAL --region "$REGION" || true
+
+echo "--- WAF Web ACLs (CLOUDFRONT / us-east-1) ---"
+aws wafv2 list-web-acls --scope CLOUDFRONT --region us-east-1 || true
+
+echo "--- Customer-managed KMS keys ---"
+aws kms list-keys --region "$REGION" --output text || true
+
+echo "--- Self-owned AMIs ---"
+aws ec2 describe-images --region "$REGION" --owners self --query 'Images[].ImageId' --output text || true
+
+echo "--- Self-owned snapshots ---"
+aws ec2 describe-snapshots --region "$REGION" --owner-ids self --query 'Snapshots[].SnapshotId' --output text || true
 
 echo
 echo "=== Cleanup finished ==="
