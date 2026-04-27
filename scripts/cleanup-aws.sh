@@ -255,8 +255,17 @@ delete_amis_and_snapshots() {
     --owners self \
     --output json 2>/dev/null || true)
 
+  if [[ -z "${images_json:-}" ]]; then
+    images_json='{"Images":[]}'
+  fi
+
+  if ! echo "$images_json" | jq -e . >/dev/null 2>&1; then
+    echo "Warning: invalid JSON returned by describe-images; skipping AMI deregistration."
+    images_json='{"Images":[]}'
+  fi
+
   local image_count
-  image_count=$(echo "${images_json:-{\"Images\":[]}}" | jq '.Images | length')
+  image_count=$(echo "$images_json" | jq -r '(.Images // []) | length')
 
   if [[ "$image_count" -gt 0 ]]; then
     while IFS= read -r image_id; do
@@ -265,7 +274,7 @@ delete_amis_and_snapshots() {
       aws ec2 deregister-image \
         --region "$REGION" \
         --image-id "$image_id" >/dev/null || true
-    done < <(echo "$images_json" | jq -r '.Images[]?.ImageId')
+    done < <(echo "$images_json" | jq -r '(.Images // [])[]? | .ImageId // empty')
 
     while IFS= read -r snap_id; do
       [[ -z "$snap_id" ]] && continue
@@ -273,25 +282,37 @@ delete_amis_and_snapshots() {
       aws ec2 delete-snapshot \
         --region "$REGION" \
         --snapshot-id "$snap_id" >/dev/null || true
-    done < <(echo "$images_json" | jq -r '.Images[]?.BlockDeviceMappings[]?.Ebs?.SnapshotId // empty' | sort -u)
+    done < <(echo "$images_json" | jq -r '(.Images // [])[]? | (.BlockDeviceMappings // [])[]? | .Ebs?.SnapshotId // empty' | sort -u)
   else
     echo "No self-owned AMIs found."
   fi
 
-  local snapshots
-  snapshots=$(aws ec2 describe-snapshots \
+  local snapshots_json
+  snapshots_json=$(aws ec2 describe-snapshots \
     --region "$REGION" \
     --owner-ids self \
-    --query 'Snapshots[].SnapshotId' \
-    --output text 2>/dev/null || true)
+    --output json 2>/dev/null || true)
 
-  if [[ -n "${snapshots:-}" ]]; then
-    for snapshot_id in $snapshots; do
+  if [[ -z "${snapshots_json:-}" ]]; then
+    snapshots_json='{"Snapshots":[]}'
+  fi
+
+  if ! echo "$snapshots_json" | jq -e . >/dev/null 2>&1; then
+    echo "Warning: invalid JSON returned by describe-snapshots; skipping standalone snapshot deletion."
+    snapshots_json='{"Snapshots":[]}'
+  fi
+
+  local snapshot_count
+  snapshot_count=$(echo "$snapshots_json" | jq -r '(.Snapshots // []) | length')
+
+  if [[ "$snapshot_count" -gt 0 ]]; then
+    while IFS= read -r snapshot_id; do
+      [[ -z "$snapshot_id" ]] && continue
       echo "Deleting snapshot ${snapshot_id}"
       aws ec2 delete-snapshot \
         --region "$REGION" \
         --snapshot-id "$snapshot_id" >/dev/null || true
-    done
+    done < <(echo "$snapshots_json" | jq -r '(.Snapshots // [])[]? | .SnapshotId // empty')
   else
     echo "No remaining self-owned snapshots found."
   fi
